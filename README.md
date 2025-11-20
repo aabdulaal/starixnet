@@ -1,1 +1,43 @@
-# STARIXNetNeural Network for multivariate and multi-attribute time-series forecasting purposes.The code is managed with Poetry for consistent builds, and tests reside in the tests directory. This setup ensures reliability and supports flexible model architectures for use in data-driven environments.## Maintainer(s)Ahmed Abdulaal <ahmed.abdulaal@walmart.com>## InstallationThis project was created and managed using Poetry. the Python dependency management tool, to ensure repeatable installs and distribution-ready builds. ### Option 1: asdf and poetry1. Install [asdf](https://asdf-vm.com/) CLI tool2. Run `make setup` from the project root directory.### Option 2: poetry only1. Follow [poetry's official documentaton](https://python-poetry.org/docs/#osx--linux--bashonwindows-install-instructions) for installation or install with `pip install poetry`2. Run `poetry install` from the project root directory.## Testing### Unit testingAll unit tests are in the tests directory. They can be run locally with `make test.unit`.# LicenseThis project is licensed under the **Apache License, Version 2.0**. See the [LICENSE](LICENSE) file for details.## Third‑Party LicensesThis project uses several third‑party packages, and we include detailed licensing information for them. The third party licenses cen be generated and placed in the `/licenses` directory with following command:```bashpip-licenses --format=json > licenses/third-party-licenses.json```
+# STARIXNet
+
+Neural Network for multivariate and multi-attribute time-series forecasting purposes.
+
+The code is managed with Poetry for consistent builds, and tests reside in the tests directory. This setup ensures reliability and supports flexible model architectures for use in data-driven environments.
+
+
+## Maintainer(s)
+
+Ahmed Abdulaal <ahmed.abdulaal@walmart.com>
+
+## Installation
+
+This project was created and managed using Poetry. the Python dependency management tool, to ensure repeatable installs and distribution-ready builds. 
+
+### Option 1: asdf and poetry
+
+1. Install [asdf](https://asdf-vm.com/) CLI tool
+
+2. Run `make setup` from the project root directory.
+
+### Option 2: poetry only
+
+1. Follow [poetry's official documentaton](https://python-poetry.org/docs/#osx--linux--bashonwindows-install-instructions) for installation or install with `pip install poetry`
+
+2. Run `poetry install` from the project root directory.
+
+## Testing
+
+### Unit testing
+
+All unit tests are in the tests directory. They can be run locally with `make test.unit`.
+
+# License
+
+This project is licensed under the **Apache License, Version 2.0**. See the [LICENSE](LICENSE) file for details.
+
+## Third‑Party Licenses
+
+This project uses several third‑party packages, and we include detailed licensing information for them. The third party licenses cen be generated and placed in the `/licenses` directory with following command:
+```bash
+pip-licenses --format=json > licenses/third-party-licenses.json
+```
