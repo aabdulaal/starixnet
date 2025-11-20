@@ -1,0 +1,397 @@
+[
+  {
+    "License": "MIT License",
+    "Name": "PyYAML",
+    "Version": "6.0.2"
+  },
+  {
+    "License": "BSD License",
+    "Name": "Pygments",
+    "Version": "2.18.0"
+  },
+  {
+    "License": "MIT License",
+    "Name": "annotated-types",
+    "Version": "0.7.0"
+  },
+  {
+    "License": "MIT License",
+    "Name": "anthropic",
+    "Version": "0.33.0"
+  },
+  {
+    "License": "MIT License",
+    "Name": "anyio",
+    "Version": "4.4.0"
+  },
+  {
+    "License": "BSD License",
+    "Name": "appnope",
+    "Version": "0.1.4"
+  },
+  {
+    "License": "Apache 2.0",
+    "Name": "asttokens",
+    "Version": "2.4.1"
+  },
+  {
+    "License": "Mozilla Public License 2.0 (MPL 2.0)",
+    "Name": "certifi",
+    "Version": "2024.2.2"
+  },
+  {
+    "License": "MIT License",
+    "Name": "cfgv",
+    "Version": "3.4.0"
+  },
+  {
+    "License": "MIT License",
+    "Name": "charset-normalizer",
+    "Version": "3.3.2"
+  },
+  {
+    "License": "BSD License",
+    "Name": "click",
+    "Version": "8.1.8"
+  },
+  {
+    "License": "BSD License",
+    "Name": "comm",
+    "Version": "0.2.2"
+  },
+  {
+    "License": "MIT License",
+    "Name": "debugpy",
+    "Version": "1.8.5"
+  },
+  {
+    "License": "BSD License",
+    "Name": "decorator",
+    "Version": "5.1.1"
+  },
+  {
+    "License": "Python Software Foundation License",
+    "Name": "defusedxml",
+    "Version": "0.7.1"
+  },
+  {
+    "License": "Python Software Foundation License",
+    "Name": "distlib",
+    "Version": "0.4.0"
+  },
+  {
+    "License": "Apache Software License",
+    "Name": "distro",
+    "Version": "1.9.0"
+  },
+  {
+    "License": "MIT License",
+    "Name": "executing",
+    "Version": "2.0.1"
+  },
+  {
+    "License": "MIT License",
+    "Name": "fastapi",
+    "Version": "0.115.12"
+  },
+  {
+    "License": "The Unlicense (Unlicense)",
+    "Name": "filelock",
+    "Version": "3.15.4"
+  },
+  {
+    "License": "BSD License",
+    "Name": "fsspec",
+    "Version": "2024.6.1"
+  },
+  {
+    "License": "MIT License",
+    "Name": "h11",
+    "Version": "0.14.0"
+  },
+  {
+    "License": "BSD License",
+    "Name": "httpcore",
+    "Version": "1.0.5"
+  },
+  {
+    "License": "BSD License",
+    "Name": "httpx",
+    "Version": "0.27.0"
+  },
+  {
+    "License": "Apache Software License",
+    "Name": "huggingface-hub",
+    "Version": "0.24.5"
+  },
+  {
+    "License": "MIT",
+    "Name": "identify",
+    "Version": "2.6.12"
+  },
+  {
+    "License": "BSD License",
+    "Name": "idna",
+    "Version": "3.7"
+  },
+  {
+    "License": "BSD License",
+    "Name": "ipykernel",
+    "Version": "6.29.5"
+  },
+  {
+    "License": "BSD License",
+    "Name": "ipython",
+    "Version": "8.26.0"
+  },
+  {
+    "License": "MIT License",
+    "Name": "jedi",
+    "Version": "0.19.1"
+  },
+  {
+    "License": "MIT License",
+    "Name": "jiter",
+    "Version": "0.5.0"
+  },
+  {
+    "License": "BSD License",
+    "Name": "jsonpatch",
+    "Version": "1.33"
+  },
+  {
+    "License": "BSD License",
+    "Name": "jsonpointer",
+    "Version": "3.0.0"
+  },
+  {
+    "License": "BSD License",
+    "Name": "jupyter_client",
+    "Version": "8.6.2"
+  },
+  {
+    "License": "BSD License",
+    "Name": "jupyter_core",
+    "Version": "5.7.2"
+  },
+  {
+    "License": "MIT License",
+    "Name": "langchain-anthropic",
+    "Version": "0.1.22"
+  },
+  {
+    "License": "MIT License",
+    "Name": "langchain-core",
+    "Version": "0.2.29"
+  },
+  {
+    "License": "MIT License",
+    "Name": "langchain-openai",
+    "Version": "0.1.21"
+  },
+  {
+    "License": "MIT License",
+    "Name": "langgraph",
+    "Version": "0.2.3"
+  },
+  {
+    "License": "MIT License",
+    "Name": "langgraph-checkpoint",
+    "Version": "1.0.2"
+  },
+  {
+    "License": "MIT License",
+    "Name": "langsmith",
+    "Version": "0.1.99"
+  },
+  {
+    "License": "BSD License",
+    "Name": "matplotlib-inline",
+    "Version": "0.1.7"
+  },
+  {
+    "License": "BSD License",
+    "Name": "nest-asyncio",
+    "Version": "1.6.0"
+  },
+  {
+    "License": "BSD License",
+    "Name": "nodeenv",
+    "Version": "1.9.1"
+  },
+  {
+    "License": "BSD License",
+    "Name": "numpy",
+    "Version": "2.3.1"
+  },
+  {
+    "License": "Apache Software License",
+    "Name": "openai",
+    "Version": "1.40.3"
+  },
+  {
+    "License": "Apache Software License; MIT License",
+    "Name": "orjson",
+    "Version": "3.10.7"
+  },
+  {
+    "License": "Apache Software License; BSD License",
+    "Name": "packaging",
+    "Version": "24.1"
+  },
+  {
+    "License": "BSD License",
+    "Name": "pandas",
+    "Version": "2.3.0"
+  },
+  {
+    "License": "MIT License",
+    "Name": "parso",
+    "Version": "0.8.4"
+  },
+  {
+    "License": "ISC License (ISCL)",
+    "Name": "pexpect",
+    "Version": "4.9.0"
+  },
+  {
+    "License": "MIT License",
+    "Name": "platformdirs",
+    "Version": "4.2.2"
+  },
+  {
+    "License": "MIT License",
+    "Name": "pre_commit",
+    "Version": "4.2.0"
+  },
+  {
+    "License": "BSD License",
+    "Name": "prompt_toolkit",
+    "Version": "3.0.47"
+  },
+  {
+    "License": "BSD License",
+    "Name": "psutil",
+    "Version": "6.0.0"
+  },
+  {
+    "License": "ISC License (ISCL)",
+    "Name": "ptyprocess",
+    "Version": "0.7.0"
+  },
+  {
+    "License": "MIT License",
+    "Name": "pure_eval",
+    "Version": "0.2.3"
+  },
+  {
+    "License": "MIT License",
+    "Name": "pydantic",
+    "Version": "2.8.2"
+  },
+  {
+    "License": "MIT License",
+    "Name": "pydantic_core",
+    "Version": "2.20.1"
+  },
+  {
+    "License": "Apache Software License; BSD License",
+    "Name": "python-dateutil",
+    "Version": "2.9.0.post0"
+  },
+  {
+    "License": "MIT License",
+    "Name": "pytz",
+    "Version": "2025.2"
+  },
+  {
+    "License": "BSD License",
+    "Name": "pyzmq",
+    "Version": "26.1.0"
+  },
+  {
+    "License": "Apache Software License",
+    "Name": "regex",
+    "Version": "2024.7.24"
+  },
+  {
+    "License": "Apache Software License",
+    "Name": "requests",
+    "Version": "2.32.3"
+  },
+  {
+    "License": "MIT License",
+    "Name": "six",
+    "Version": "1.16.0"
+  },
+  {
+    "License": "Apache Software License; MIT License",
+    "Name": "sniffio",
+    "Version": "1.3.1"
+  },
+  {
+    "License": "MIT License",
+    "Name": "stack-data",
+    "Version": "0.6.3"
+  },
+  {
+    "License": "BSD License",
+    "Name": "starlette",
+    "Version": "0.46.2"
+  },
+  {
+    "License": "Apache Software License",
+    "Name": "tenacity",
+    "Version": "8.5.0"
+  },
+  {
+    "License": "MIT License\n\nCopyright (c) 2022 OpenAI, Shantanu Jain\n\nPermission is hereby granted, free of charge, to any person obtaining a copy\nof this software and associated documentation files (the \"Software\"), to deal\nin the Software without restriction, including without limitation the rights\nto use, copy, modify, merge, publish, distribute, sublicense, and/or sell\ncopies of the Software, and to permit persons to whom the Software is\nfurnished to do so, subject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in all\ncopies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\nIMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\nFITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE\nAUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER\nLIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\nOUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE\nSOFTWARE.\n",
+    "Name": "tiktoken",
+    "Version": "0.7.0"
+  },
+  {
+    "License": "Apache Software License",
+    "Name": "tokenizers",
+    "Version": "0.20.0"
+  },
+  {
+    "License": "Apache Software License",
+    "Name": "tornado",
+    "Version": "6.4.1"
+  },
+  {
+    "License": "MIT License; Mozilla Public License 2.0 (MPL 2.0)",
+    "Name": "tqdm",
+    "Version": "4.66.5"
+  },
+  {
+    "License": "BSD License",
+    "Name": "traitlets",
+    "Version": "5.14.3"
+  },
+  {
+    "License": "Python Software Foundation License",
+    "Name": "typing_extensions",
+    "Version": "4.12.2"
+  },
+  {
+    "License": "Apache Software License",
+    "Name": "tzdata",
+    "Version": "2025.2"
+  },
+  {
+    "License": "MIT License",
+    "Name": "urllib3",
+    "Version": "2.2.2"
+  },
+  {
+    "License": "BSD License",
+    "Name": "uvicorn",
+    "Version": "0.34.2"
+  },
+  {
+    "License": "MIT License",
+    "Name": "virtualenv",
+    "Version": "20.32.0"
+  }
+]
