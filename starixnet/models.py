@@ -242,6 +242,7 @@ class STARIXNet(BaseModel):
         exog_filters: Optional[Union[int, List[int]]] = None,
         exog_filters_growth: int = 1,
         exog_kernel_size: Optional[int] = None,
+        applied_attributes: List[str] = ["seasonal", "temporal", "autoregressive", "exogenous"],
         **kwargs,
     ):
         """
@@ -307,6 +308,8 @@ class STARIXNet(BaseModel):
             exog_kernel_size (Optional[int], optional): Kernel size for convolutional layer applied ot exogenous signal.
                 or reference, refer to `torch.nn.Conv1d` in the PyTorch documentation, where this argument translates
                 to `kernel_size`. Defaults to None.
+            applied_attributes (List[str], optional): Attributes of the time series desired for modeling. Defaults to [
+                "seasonal", "temporal", "autoregressive", "exogenous"].
             **kwargs: Additional arguments to `BaseModel` base model class.
         """
         super(STARIXNet, self).__init__(enforced_periods=enforced_periods, **kwargs)
@@ -328,11 +331,12 @@ class STARIXNet(BaseModel):
         self.exog_filters = exog_filters
         self.exog_filters_growth = exog_filters_growth
         self.exog_kernel_size = exog_kernel_size
+        self.applied_attributes = applied_attributes
 
         self._freqs: List[float] = []
         self._params: nn.Module = nn.ParameterDict()
         self._moduls: nn.Module = nn.ModuleDict()
-        self._forward_logic: List[Callable] = [self._forward_seasonality, self._forward_temporal]
+        self._forward_logic: Dict[str, Callable] = {}
         self._decoder_labels: List[str] = []
 
         # general-use nn operations
@@ -341,16 +345,19 @@ class STARIXNet(BaseModel):
 
     def _build(self) -> Self:
         # seasonality encoder-decoder
-        self._build_seasonality_autoencoder()
+        if 'seasonal' in self.applied_attributes:
+            self._build_seasonality_autoencoder()
 
         # temporal encoder-decoder
-        self._build_temporal_autoencoder()
+        if 'temporal' in self.applied_attributes:
+            self._build_temporal_autoencoder()
 
         # autoregression encoder-decoder
-        self._build_autoregression_autoencoder()
+        if 'autoregressive' in self.applied_attributes:
+            self._build_autoregression_autoencoder()
 
         # exogenous encoder-decoder
-        if self._exog_size:
+        if self._exog_size and 'exogenous' in self.applied_attributes:
             # prepare common parameters
             if not self.exog_kernel_size:
                 self.exog_kernel_size = min(50, (self.lagged_steps + 1) // 2)  # TODO: verify that it is a good default
@@ -385,11 +392,21 @@ class STARIXNet(BaseModel):
         return self
 
     def _forward(self, x: Iterable[torch.Tensor], kwargs: List[Dict[str, Any]]) -> List[torch.Tensor]:
-        return [
-            self._forward_logic[0](x[0], **kwargs[0])
-        ] + [
-            fwd_fn(x_, **kwarg) for fwd_fn, x_, kwarg in zip(self._forward_logic[1:], x, kwargs[1:])
-        ]
+        outputs = []
+        if "seasonal" in self.applied_attributes:
+            outputs.append(self._forward_logic['seasonal'](x[0], **kwargs['seasonal']))
+        if 'temporal' in self.applied_attributes:
+            outputs.append(self._forward_logic['temporal'](x[0], **kwargs['temporal']))
+        if 'autoregressive' in self.applied_attributes:
+            outputs += [self._forward_logic['autoregressive'](x[1], **kwargs['autoregressive'])]
+        if 'exogenous' in self.applied_attributes:
+            if isinstance(self._exog_size, list):
+                for i in range(len(self._exog_size)):
+                    outputs.append(self._forward_logic[f"exogenous_{i+1}"](x[2+i], **kwargs[f"exogenous_{i + 1}"]))
+            else:
+                outputs.append(self._forward_logic['exogenous'](x[2], **kwargs['exogenous']))
+        return outputs
+         
 
     def fit(
         self,
@@ -463,13 +480,17 @@ class STARIXNet(BaseModel):
                     self._convert_df_to_seq(_exog, self.lagged_steps, self.forecast_steps, includes_target=False)
                     for _exog in exog
                 ]
-                x_exog = [x.iloc[:-self.forecast_steps] for x in x_exog]  # to ensure size matches that of x_endog and y
+                x_exog = [x.iloc[:-self.forecast_steps] for x in x_exog]  # ensures size matches with x_endog and y
             else:
-                x_exog = self._convert_df_to_seq(exog, self.lagged_steps, self.forecast_steps, includes_target=False)
+                x_exog = self._convert_df_to_seq(
+                    exog, self.lagged_steps, self.forecast_steps, includes_target=False
+                )
                 x_exog = x_exog.iloc[:-self.forecast_steps]  # to ensure size matches that of x_endog and y
         else:
             x_exog = None
-
+            if 'exogenous' in self.applied_attributes:
+                self.applied_attributes.remove('exogenous')  # avoid conflicts if exogenous is desired but no exog given
+            
         # insure size matching
         if self.forecast_steps < self.lagged_steps:
             x_time = x_time.iloc[self.lagged_steps - self.forecast_steps:]
@@ -641,6 +662,7 @@ class STARIXNet(BaseModel):
                 'exog_filters': self.exog_filters,
                 "exog_filters_growth": self.exog_filters_growth,
                 'exog_kernel_size': self.exog_kernel_size,
+                'applied_attributes': self.applied_attributes,
                 '_time_scaler': self._time_scaler,
                 '_freqs': self._freqs,
                 '_params': self._params,
@@ -746,18 +768,21 @@ class STARIXNet(BaseModel):
             torch.tensor(x_time.values.reshape(-1, self.forecast_steps, 1)).float(),
             torch.tensor(x_endog.values.reshape(-1, self.lagged_steps, self._endog_size)).float(),
         ]
-        kwargs = [{}, {}, {}]  # additional arguments to pass with tesnors and tensors_val (for seasonal, temporal, ar)
+        # kwargs = [{}, {}, {}]
+        kwargs = {
+            'seasonal': {}, 'temporal': {}, 'autoregressive': {}
+        }  # additional arguments to pass with tesnors and tensors_val (for seasonal, temporal, ar)
         if x_exog is not None:
             if isinstance(x_exog, list):
                 for i, x in enumerate(x_exog):
                     tensors.append(torch.tensor(x.values.reshape(-1, self.lagged_steps, self._exog_size[i])).float())
-                    kwargs.append({'suffix': f"_{i + 1}"})
+                    kwargs[f"exogenous_{i + 1}"] = {'suffix': f"_{i + 1}"}
             else:
                 tensors.append(torch.tensor(x_exog.values.reshape(-1, self.lagged_steps, self._exog_size)).float())
-                kwargs.append({})
+                kwargs['exogenous'] = {}
         if y is not None:
             tensors.append(torch.tensor(y.values.reshape(-1, self.forecast_steps, self._endog_size)).float())
-            kwargs.append({})
+            kwargs['sample_weights'] = {}
         if y_sample_weights is not None:
             tensors.append(torch.tensor(y_sample_weights.values.reshape(-1, self.forecast_steps, 1)).float())
         xy_td = TensorDataset(*tensors)
@@ -776,6 +801,7 @@ class STARIXNet(BaseModel):
         self._params['amps'] = nn.Parameter(torch.zeros(n_freqs, self._endog_size))  # amplitudes
         self._params['phases'] = nn.Parameter(torch.zeros(n_freqs, self._endog_size))  # angular freqs * phase shifts
         self._params['disps'] = nn.Parameter(torch.zeros(self._endog_size))  # displacements
+        self._forward_logic['seasonal'] = self._forward_seasonality
         self._decoder_labels.append('seasonal')
         return self
 
@@ -791,6 +817,7 @@ class STARIXNet(BaseModel):
             self._moduls['temporal_hlayers'][f'linear_{hl+1}'] = nn.Linear(input_dim, output_dim)
             input_dim = output_dim
         self._moduls['temporal_output'] = nn.Linear(input_dim, self._endog_size)  # output layer
+        self._forward_logic['temporal'] = self._forward_temporal
         self._decoder_labels.append('temporal')
         return self
 
@@ -822,7 +849,7 @@ class STARIXNet(BaseModel):
                 input_filters, self._endog_size, self.endog_kernel_size
             )
             self._moduls['ar_output'] = nn.AdaptiveAvgPool1d(self.forecast_steps)
-            self._forward_logic.append(self._forward_autoregression_multivariate)
+            self._forward_logic['autoregressive'] = self._forward_autoregression_multivariate
         else:
             for hl in range(self.n_ar_hidden_layers):
                 output_dim = input_dim + increment
@@ -833,7 +860,7 @@ class STARIXNet(BaseModel):
             self._moduls['ar_output'] = nn.ModuleList(
                 [nn.Linear(input_dim, self.forecast_steps) for _ in range(self._endog_size)]
             )  # output layer
-            self._forward_logic.append(self._forward_autoregression_univariate)
+            self._forward_logic['autoregressive'] = self._forward_autoregression_univariate
         self._decoder_labels.append('autoregressive')
         return self
 
@@ -858,7 +885,7 @@ class STARIXNet(BaseModel):
                 input_filters, self._endog_size, self.exog_kernel_size
             )
             self._moduls[f"exog{suffix}_output"] = nn.AdaptiveMaxPool1d(self.forecast_steps)
-            self._forward_logic.append(self._forward_exogenous_multivariate)
+            self._forward_logic[f"exogenous{suffix}"] = self._forward_exogenous_multivariate
         else:
             if exog_size > 1:  # TODO: a nd add condition for user to desire convolutions
                 self._moduls[f"exog{suffix}_conv"] = nn.Conv1d(exog_size, exog_filters, self.exog_kernel_size)  # output will be filters x kernel_size (new_steps)
@@ -883,7 +910,7 @@ class STARIXNet(BaseModel):
             self._moduls[f"exog{suffix}_output"] = nn.ModuleList(
                 [nn.Linear(input_dim, self.forecast_steps) for _ in range(self._endog_size)]
             )  # output layer
-            self._forward_logic.append(self._forward_exogenous_univariate)
+            self._forward_logic[f"exogenous{suffix}"] = self._forward_exogenous_univariate
         self._decoder_labels.append(f"exogenous{suffix}")
         return self
 

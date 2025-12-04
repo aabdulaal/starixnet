@@ -32,10 +32,17 @@ class TestSTARIXNet(object):
         model = self._init_model(fit_multivariate=False)
         self.__test_fit(model, endog, exog_1, loss_q=(0.5, 0.5, 0.95, 0.95), sample_weights=True)
         self.__test_predict(model, endog.iloc[-1440-45:-15], exog_1.iloc[-1440-45:-15])
+        model = self._init_model(applied_attributes=["temporal", "autoregressive"])
+        self.__test_fit(model, endog, exog_1, loss_q=(0.5, 0.95), sample_weights=False)
+        self.__test_predict(model, endog.iloc[-1440-45:-15], exog_1.iloc[-1440-45:-15])
         self.__test_save(model)
         self.__test_load_model()
 
-    def _init_model(self, fit_multivariate: bool = True):
+    def _init_model(
+        self,
+        fit_multivariate: bool = True,
+        applied_attributes: List[str] = ["seasonal", "temporal", "autoregressive", "exogenous"],
+    ):
         return STARIXNet(
             10080,
             enforced_periods=[10080, 1440],
@@ -46,6 +53,7 @@ class TestSTARIXNet(object):
             forecast_steps=15,
             skip_current_step=True,
             fit_multivariate=fit_multivariate,
+            applied_attributes=applied_attributes,
         )
 
     def __test_fit(
@@ -72,14 +80,19 @@ class TestSTARIXNet(object):
             inspect_data_quality=True,
         )
         assert len(model._endog_scalers) == 2 & len(model._exog_scalers) == 2  # test if scalers are extracted
-        assert model._params and model._moduls  # test if parameters were set
+        assert model._forward_logic
+        fl = list(model._forward_logic.keys())
+        if 'seasonal' in fl:
+            assert model._params  # test if parameters were set
+        if 'temporal' in fl or 'autoregressive' in fl or 'exogenous' in fl:
+            assert model._moduls  # test if parameters were set
         assert (
             model._endog_size > 0
         ) and (
             all([exog_size > 0 for exog_size in model._exog_size]) if isinstance(exog, list) else model._exog_size > 0
         )
-        assert model._freqs and 2 * np.pi / 10080 in model._freqs and 2 * np.pi / 1440 in model._freqs
-        assert len(model._forward_logic) == 3 + len(exog) if isinstance(exog, list) else 4
+        if 'seasonal' in model._forward_logic.keys():
+            assert model._freqs and 2 * np.pi / 10080 in model._freqs and 2 * np.pi / 1440 in model._freqs
 
     def __test_predict(self, model: STARIXNet, endog: pd.DataFrame, exog: Union[pd.DataFrame, List[pd.DataFrame]]):
         preds = model.predict(endog, exog, aggregated=False)
@@ -98,5 +111,10 @@ class TestSTARIXNet(object):
 
     def __test_load_model(self):
         model = STARIXNet.load_model(path.join(cur_dir, "models", "starixnet.z"))
-        assert model._params and model._moduls
+        assert model._forward_logic
+        fl = list(model._forward_logic.keys())
+        if 'seasonal' in fl:
+            assert model._params  # test if parameters were set
+        if 'temporal' in fl or 'autoregressive' in fl or 'exogenous' in fl:
+            assert model._moduls  # test if parameters were set
         # TODO: should ideally compare every attribute of loaded model with trained model
