@@ -1,51 +1,63 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
+"""Quantile loss for STARIXNet.
+
 Copyright (c) Walmart Inc.
 
-This source code is licensed under the Apache 2.0 license found in the
-LICENSE file in the root directory of this source tree.
+This source code is licensed under the Apache 2.0 license found in the LICENSE file in the root directory of this source
+tree.
 """
 
-from typing import Optional
+from __future__ import annotations
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 
-class QLoss(nn.modules.loss._Loss):
-    def __init__(self, quantile: float):
-        """
-        Quantile loss.
+class QuantileLoss(nn.Module):
+    """Pinball (quantile) loss.
 
-        A `quantile=0.5` will give half of the mean absolute error as it is calculated as
-        `max(squantile * error, (quantile - 1) * error)`.
+    For a quantile ``q`` and error ``e = y - y_hat``, the loss is
+    ``max(q * e, (q - 1) * e)``. With ``q=0.5`` this reduces to half the
+    mean absolute error.
+    """
+
+    def __init__(self, quantile: float) -> None:
+        """Initialize the loss.
 
         Args:
-            quantile (float): Quantile value for computing quantile loss. max(q * (y-y_pred), (1-q) * (y_pred-y))
+            quantile: Target quantile in ``(0, 1)``. Values near 0.5 weight over- and under-estimation equally; values
+                closer to 0 or 1 penalize one side more heavily.
         """
-        super(QLoss, self).__init__()
+        super().__init__()
+        if not 0.0 < quantile < 1.0:
+            raise ValueError(f"quantile must be in (0, 1), got {quantile}")
         self.quantile = quantile
 
     def forward(
-            self, inputs: torch.Tensor, targets: torch.Tensor, sample_weights: Optional[torch.Tensor] = None
+        self,
+        inputs: torch.Tensor,
+        targets: torch.Tensor,
+        sample_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """
-        Compute the quantile loss.
+        """Compute the mean quantile loss.
 
         Args:
-            inputs (torch.Tensor): Prediction values (i.e. y_pred).
-            targets (torch.Tensor): Observed values (i.e. y).
-            sample_weights (Optional[torch.Tensor], optional): Weights for obtaining a sample-biased loss calculation.
-                Defaults to None.
+            inputs: Predicted values, shape matching ``targets``.
+            targets: Observed values.
+            sample_weights: Optional per-sample weights broadcastable with ``loss[..., 0]``. If provided, weights are
+                multiplied element-wise before reduction.
 
         Returns:
-            torch.Tensor: Mean of the quantile loss.
+            Scalar tensor with the mean of the (weighted) quantile loss.
         """
-        assert inputs.shape == targets.shape, "Shapes of predictions and targets must match"
+        if inputs.shape != targets.shape:
+            raise ValueError(f"shape mismatch: inputs {tuple(inputs.shape)} vs targets {tuple(targets.shape)}")
         error = targets - inputs
-        loss = torch.max(self.quantile * error, (self.quantile - 1) * error)
+        loss = torch.maximum(self.quantile * error, (self.quantile - 1.0) * error)
         if sample_weights is not None:
-            assert loss.shape[:-1] == sample_weights.shape[:-1], "Shapes of predictions and sample weights must match"
+            if loss.shape[:-1] != sample_weights.shape[:-1]:
+                raise ValueError(
+                    "sample_weights must match loss shape on all but the last dim; "
+                    f"got loss {tuple(loss.shape)}, weights {tuple(sample_weights.shape)}"
+                )
             loss = loss * sample_weights
-        return torch.mean(loss)
+        return loss.mean()

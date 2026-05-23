@@ -1,52 +1,71 @@
 PROJECT=starixnet
-SOURCE_OBJECTS=starixnet
-PYTHON_VERSION=3.11.12
+SOURCE_OBJECTS=starixnet benchmark tests
+
+# Auto-detect uv; fall back to assuming the user has the project's venv
+# activated (or is running on a system Python where the deps are installed).
+HAS_UV := $(shell command -v uv 2>/dev/null)
+ifdef HAS_UV
+	RUN := uv run
+	SETUP := uv sync --extra dev
+else
+	RUN :=
+	SETUP := python -m pip install -r requirements.txt && python -m pip install -e . --no-deps
+endif
 
 
-lints.ci: lints.flake8.ci
-lints: lints.flake8
-lints.flake8:
-	poetry run flake8 ${SOURCE_OBJECTS}
-lints.flake8.ci:
-	poetry run flake8 --output-file=output.txt --exit-zero ${SOURCE_OBJECTS}
+# -------- setup --------
 
+setup:
+	$(SETUP)
 
-setup: setup.sysdeps setup.python setup.project
+setup.uv:
+	uv sync --extra dev
+
+setup.pip:
+	python -m pip install -r requirements.txt
+	python -m pip install -e . --no-deps
+
 setup.uninstall:
-	poetry env remove ${PYTHON_VERSION} || true
-setup.project:
-	@poetry env use $$(python -c "import sys; print(sys.executable)")
-	@echo "Active interpreter path: $$(poetry env info --path)/bin/python"
-	poetry install
-setup.python.activation:
-	@asdf local python ${PYTHON_VERSION} >/dev/null 2>&1 /dev/null || true
-setup.python: setup.python.activation
-	@echo "Active Python version: $$(python --version)"
-	@echo "Base Interpreter path: $$(python -c 'import sys; print(sys.executable)')"
-	@test "$$(python --version | cut -d' ' -f2)" = "${PYTHON_VERSION}" \
-        || (echo "Please activate python ${PYTHON_VERSION}" && exit 1)
-setup.sysdeps:
-	asdf plugin update --all
-	@for p in $$(cut -d" " -f1 .tool-versions | sort | tr '\n' ' '); do \
-        asdf plugin add $$p || true; \
-        done;
-	asdf install
+	rm -rf .venv
 
+# Regenerate requirements.txt from uv.lock so non-uv users get a pinned install.
+requirements:
+	uv export --format requirements-txt --no-hashes --no-emit-project --extra dev -o requirements.txt
+
+
+# -------- lint --------
+
+lints: lints.ruff
+lints.ci: lints.ruff.ci
+lints.ruff:
+	$(RUN) ruff check $(SOURCE_OBJECTS)
+	$(RUN) ruff format --check $(SOURCE_OBJECTS)
+lints.ruff.ci:
+	$(RUN) ruff check --output-format=github $(SOURCE_OBJECTS)
+lints.fix:
+	$(RUN) ruff check --fix $(SOURCE_OBJECTS)
+	$(RUN) ruff format $(SOURCE_OBJECTS)
+
+
+# -------- test --------
 
 test: setup test.unit test.integration
 test.integration:
-	poetry run pytest -s \
+	$(RUN) pytest -s \
 		--cov \
 		--cov-fail-under=0 \
-		--cov-report \
-		xml:./int-coverage.xml \
+		--cov-report xml:./int-coverage.xml \
 		--junitxml=./int-results.xml \
 		tests/integration
 test.unit:
-	poetry run pytest -s \
+	$(RUN) pytest -s \
 		--cov \
 		--cov-fail-under=80 \
 		--cov-report xml:./coverage.xml \
 		--cov-report term \
 		--junitxml=./results.xml \
 		--ignore=tests/integration
+
+.PHONY: setup setup.uv setup.pip setup.uninstall requirements \
+        lints lints.ci lints.ruff lints.ruff.ci lints.fix \
+        test test.integration test.unit
