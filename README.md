@@ -104,6 +104,18 @@ The `applied_attributes` argument selects which decoder branches are built:
 STARIXNet(..., applied_attributes=["temporal", "autoregressive"])
 ```
 
+## Tutorial notebook
+
+[`notebooks/starixnet_tutorial.ipynb`](notebooks/starixnet_tutorial.ipynb) walks through the full workflow on a synthetic service-monitoring dataset (CPU / TPS / memory targets with traffic, deployment, error-rate, and network exogenous signals). It covers data generation, training, per-decoder forecast inspection, the quantile-aggregation sweep, and save/load.
+
+```bash
+# install Jupyter + matplotlib (kept out of the core dependencies)
+uv sync --extra notebook                # or: pip install -e ".[notebook]"
+uv run jupyter lab notebooks/starixnet_tutorial.ipynb
+```
+
+The notebook is regenerated from a source script (`notebooks/_build_tutorial.py`) — keeps the diff reviewable as Python rather than raw JSON.
+
 ## Architecture overview
 
 | Decoder | Input | Mechanism |
