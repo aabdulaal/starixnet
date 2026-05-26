@@ -31,10 +31,11 @@ from starixnet.utilities import make_seq2seq_windows
 
 
 class LightningBaseModel(BaseModel):
-    """Base for the deep-learning benchmarks (LSTM, DeepAR, TFT).
+    """Base for the deep-learning benchmarks (LSTM, DeepAR, TFT, DLinear, PatchTST, iTransformer).
 
     Provides sequence preparation, Lightning training orchestration, and save/load via a zip archive (joblib config +
-    ``state_dict``).
+    ``state_dict``). All subclasses share the same ``fit`` / ``predict`` / ``save`` / ``load_model`` signature so they
+    are drop-in interchangeable in an inference service.
     """
 
     def __init__(self, **kwargs: Any) -> None:
@@ -689,6 +690,444 @@ class TFT(LightningBaseModel):
                 "quantiles": self.quantiles,
                 "n_attention_heads": self.n_attention_heads,
                 "output_size": self.output_size,
+            }
+        )
+        return config
+
+    @classmethod
+    def load_model(cls, filepath: str | BytesIO) -> Self:
+        instance, state_dict = cls._load_archive(filepath)
+        instance._build()
+        instance._model.load_state_dict(state_dict)
+        return instance
+
+
+# -------------------------------------------------------------------------------------------------------------------- #
+# DLinear                                                                                                              #
+# -------------------------------------------------------------------------------------------------------------------- #
+
+
+class _SeriesDecomp(nn.Module):
+    """Trend / seasonal split via a centred moving average (Zeng et al., 2022).
+
+    Pads the input with the boundary values so the trend output matches the input length. The seasonal component is the
+    residual.
+    """
+
+    def __init__(self, kernel_size: int) -> None:
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.avg = nn.AvgPool1d(kernel_size=kernel_size, stride=1, padding=0)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # x: (B, T, C). AvgPool1d expects (B, C, T), so we permute around the pool call.
+        pad_left = (self.kernel_size - 1) // 2
+        pad_right = self.kernel_size - 1 - pad_left
+        front = x[:, 0:1, :].repeat(1, pad_left, 1)
+        end = x[:, -1:, :].repeat(1, pad_right, 1)
+        padded = torch.cat([front, x, end], dim=1).permute(0, 2, 1)
+        trend = self.avg(padded).permute(0, 2, 1)
+        seasonal = x - trend
+        return seasonal, trend
+
+
+class _DLinearNet(pl.LightningModule):
+    """Decomposition-Linear forecaster (Zeng et al., 2022).
+
+    Splits the encoder window into trend + seasonal via moving-average decomposition and applies a dedicated linear
+    projection over the time dimension to each component. Channel-independent in the ``individual=True`` mode.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        endog_size: int,
+        lagged_steps: int,
+        prediction_length: int,
+        kernel_size: int,
+        individual: bool,
+    ) -> None:
+        super().__init__()
+        self.input_size = input_size
+        self.endog_size = endog_size
+        self.lagged_steps = lagged_steps
+        self.prediction_length = prediction_length
+        self.individual = individual
+        self.decomp = _SeriesDecomp(kernel_size)
+
+        if individual:
+            self.linear_seasonal = nn.ModuleList(
+                [nn.Linear(lagged_steps, prediction_length) for _ in range(input_size)]
+            )
+            self.linear_trend = nn.ModuleList([nn.Linear(lagged_steps, prediction_length) for _ in range(input_size)])
+        else:
+            self.linear_seasonal = nn.Linear(lagged_steps, prediction_length)
+            self.linear_trend = nn.Linear(lagged_steps, prediction_length)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, T, C)
+        seasonal, trend = self.decomp(x)
+        seasonal = seasonal.permute(0, 2, 1)  # (B, C, T)
+        trend = trend.permute(0, 2, 1)
+
+        if self.individual:
+            seasonal_out = torch.stack(
+                [self.linear_seasonal[i](seasonal[:, i, :]) for i in range(self.input_size)],
+                dim=1,
+            )
+            trend_out = torch.stack(
+                [self.linear_trend[i](trend[:, i, :]) for i in range(self.input_size)],
+                dim=1,
+            )
+        else:
+            seasonal_out = self.linear_seasonal(seasonal)
+            trend_out = self.linear_trend(trend)
+
+        out = (seasonal_out + trend_out).permute(0, 2, 1)  # (B, prediction_length, C)
+        # Encoder layout is [endog | exog]; keep only the endog channels in the forecast.
+        return out[:, :, : self.endog_size]
+
+    def training_step(self, batch: tuple[torch.Tensor, torch.Tensor], _: int) -> torch.Tensor:
+        x, y = batch
+        loss = torch.nn.functional.mse_loss(self(x), y)
+        self.log("train_loss", loss, prog_bar=True)
+        return loss
+
+    def validation_step(self, batch: tuple[torch.Tensor, torch.Tensor], _: int) -> torch.Tensor:
+        x, y = batch
+        loss = torch.nn.functional.mse_loss(self(x), y)
+        self.log("val_loss", loss, prog_bar=True)
+        return loss
+
+    def configure_optimizers(self) -> torch.optim.Optimizer:
+        return torch.optim.Adam(self.parameters())
+
+    def predict_step(self, x: torch.Tensor, _: int) -> torch.Tensor:
+        return self(x)
+
+
+class DLinear(LightningBaseModel):
+    """Decomposition-Linear baseline (Zeng et al., 2022).
+
+    A minimal-parameter forecaster that splits the encoder window into trend + seasonal via moving average and applies
+    independent linear projections over the time dimension. Serves as the architectural sanity check for whether more
+    complex models in the benchmark are justified.
+    """
+
+    def __init__(
+        self,
+        kernel_size: int = 25,
+        individual: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.kernel_size = kernel_size
+        self.individual = individual
+
+    def _build(self) -> None:
+        self._model = _DLinearNet(
+            input_size=self._total_input_size,
+            endog_size=self._endog_size,
+            lagged_steps=self.lagged_steps,
+            prediction_length=self._prediction_length,
+            kernel_size=self.kernel_size,
+            individual=self.individual,
+        )
+
+    def get_config(self) -> dict[str, Any]:
+        config = super().get_config()
+        config.update(
+            {
+                "kernel_size": self.kernel_size,
+                "individual": self.individual,
+            }
+        )
+        return config
+
+    @classmethod
+    def load_model(cls, filepath: str | BytesIO) -> Self:
+        instance, state_dict = cls._load_archive(filepath)
+        instance._build()
+        instance._model.load_state_dict(state_dict)
+        return instance
+
+
+# -------------------------------------------------------------------------------------------------------------------- #
+# PatchTST                                                                                                             #
+# -------------------------------------------------------------------------------------------------------------------- #
+
+
+class _PatchTSTNet(pl.LightningModule):
+    """Channel-independent patch transformer (Nie et al., 2023).
+
+    Each channel's lagged window is split into overlapping patches and passed through a shared transformer encoder. The
+    head projects the flattened patch embeddings to the forecast horizon. Channel-independence means cross-variate
+    dependencies are not modelled here — that role is reserved for iTransformer in the benchmark suite.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        endog_size: int,
+        lagged_steps: int,
+        prediction_length: int,
+        patch_len: int,
+        stride: int,
+        d_model: int,
+        n_heads: int,
+        n_layers: int,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        self.input_size = input_size
+        self.endog_size = endog_size
+        self.lagged_steps = lagged_steps
+        self.prediction_length = prediction_length
+        self.patch_len = max(1, min(patch_len, lagged_steps))
+        self.stride = max(1, min(stride, self.patch_len))
+
+        # Replicate-pad the tail so (lagged_steps - patch_len) is divisible by stride and the patch count is integer.
+        excess = (lagged_steps - self.patch_len) % self.stride
+        self.pad_size = (self.stride - excess) if excess > 0 else 0
+        padded_len = lagged_steps + self.pad_size
+        self.n_patches = (padded_len - self.patch_len) // self.stride + 1
+
+        # d_model must be divisible by n_heads for nn.MultiheadAttention.
+        head_dim = max(1, d_model // n_heads)
+        self.d_model = head_dim * n_heads
+
+        self.patch_embed = nn.Linear(self.patch_len, self.d_model)
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.n_patches, self.d_model))
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.d_model,
+            nhead=n_heads,
+            dim_feedforward=self.d_model * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.head = nn.Linear(self.n_patches * self.d_model, prediction_length)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, T, C) → (B, C, T) for time-axis patching.
+        b, _, c = x.shape
+        x = x.permute(0, 2, 1)
+        if self.pad_size > 0:
+            tail = x[:, :, -1:].repeat(1, 1, self.pad_size)
+            x = torch.cat([x, tail], dim=-1)
+        # Unfold the time dim into overlapping patches: (B, C, n_patches, patch_len).
+        patches = x.unfold(dimension=-1, size=self.patch_len, step=self.stride)
+        # Channel-independent: collapse (B, C) into one batch dim so all channels share the same transformer.
+        patches = patches.reshape(b * c, self.n_patches, self.patch_len)
+
+        h = self.patch_embed(patches) + self.pos_embed
+        h = self.encoder(h)
+        h = h.flatten(start_dim=1)  # (B*C, n_patches * d_model)
+        out = self.head(h)  # (B*C, prediction_length)
+        out = out.reshape(b, c, self.prediction_length).permute(0, 2, 1)  # (B, prediction_length, C)
+        # Encoder layout is [endog | exog]; keep only the endog channels in the forecast.
+        return out[:, :, : self.endog_size]
+
+    def training_step(self, batch: tuple[torch.Tensor, torch.Tensor], _: int) -> torch.Tensor:
+        x, y = batch
+        loss = torch.nn.functional.mse_loss(self(x), y)
+        self.log("train_loss", loss, prog_bar=True)
+        return loss
+
+    def validation_step(self, batch: tuple[torch.Tensor, torch.Tensor], _: int) -> torch.Tensor:
+        x, y = batch
+        loss = torch.nn.functional.mse_loss(self(x), y)
+        self.log("val_loss", loss, prog_bar=True)
+        return loss
+
+    def configure_optimizers(self) -> torch.optim.Optimizer:
+        return torch.optim.Adam(self.parameters())
+
+    def predict_step(self, x: torch.Tensor, _: int) -> torch.Tensor:
+        return self(x)
+
+
+class PatchTST(LightningBaseModel):
+    """Channel-independent patch-based transformer (Nie et al., 2023).
+
+    Splits each channel's lagged window into overlapping patches, processes them with a shared transformer encoder,
+    and projects the flattened patch embeddings to the forecast horizon. Channel-independence makes the model robust
+    to distribution shift in unrelated channels at the cost of ignoring cross-variate dependencies.
+    """
+
+    def __init__(
+        self,
+        patch_len: int = 16,
+        stride: int = 8,
+        d_model: int = 128,
+        n_heads: int = 4,
+        n_layers: int = 3,
+        dropout: float = 0.0,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.patch_len = patch_len
+        self.stride = stride
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.n_layers = n_layers
+        self.dropout = dropout
+
+    def _build(self) -> None:
+        self._model = _PatchTSTNet(
+            input_size=self._total_input_size,
+            endog_size=self._endog_size,
+            lagged_steps=self.lagged_steps,
+            prediction_length=self._prediction_length,
+            patch_len=self.patch_len,
+            stride=self.stride,
+            d_model=self.d_model,
+            n_heads=self.n_heads,
+            n_layers=self.n_layers,
+            dropout=self.dropout,
+        )
+
+    def get_config(self) -> dict[str, Any]:
+        config = super().get_config()
+        config.update(
+            {
+                "patch_len": self.patch_len,
+                "stride": self.stride,
+                "d_model": self.d_model,
+                "n_heads": self.n_heads,
+                "n_layers": self.n_layers,
+                "dropout": self.dropout,
+            }
+        )
+        return config
+
+    @classmethod
+    def load_model(cls, filepath: str | BytesIO) -> Self:
+        instance, state_dict = cls._load_archive(filepath)
+        instance._build()
+        instance._model.load_state_dict(state_dict)
+        return instance
+
+
+# -------------------------------------------------------------------------------------------------------------------- #
+# iTransformer                                                                                                         #
+# -------------------------------------------------------------------------------------------------------------------- #
+
+
+class _iTransformerNet(pl.LightningModule):
+    """Inverted Transformer (Liu et al., 2024) — attention over variates rather than over time.
+
+    Embeds each variate's full lagged window as a single token, then applies multi-head self-attention across the
+    variate dimension. Output projection maps the resulting per-variate embedding back to the forecast horizon.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        endog_size: int,
+        lagged_steps: int,
+        prediction_length: int,
+        d_model: int,
+        n_heads: int,
+        n_layers: int,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        self.input_size = input_size
+        self.endog_size = endog_size
+        self.lagged_steps = lagged_steps
+        self.prediction_length = prediction_length
+
+        # d_model must be divisible by n_heads for nn.MultiheadAttention.
+        head_dim = max(1, d_model // n_heads)
+        self.d_model = head_dim * n_heads
+
+        self.token_embed = nn.Linear(lagged_steps, self.d_model)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.d_model,
+            nhead=n_heads,
+            dim_feedforward=self.d_model * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.projection = nn.Linear(self.d_model, prediction_length)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, T, C) → (B, C, T) so each variate becomes a token-length sequence.
+        x = x.permute(0, 2, 1)
+        h = self.token_embed(x)  # (B, C, d_model)
+        h = self.encoder(h)
+        out = self.projection(h)  # (B, C, prediction_length)
+        out = out.permute(0, 2, 1)  # (B, prediction_length, C)
+        # Encoder layout is [endog | exog]; keep only the endog channels in the forecast.
+        return out[:, :, : self.endog_size]
+
+    def training_step(self, batch: tuple[torch.Tensor, torch.Tensor], _: int) -> torch.Tensor:
+        x, y = batch
+        loss = torch.nn.functional.mse_loss(self(x), y)
+        self.log("train_loss", loss, prog_bar=True)
+        return loss
+
+    def validation_step(self, batch: tuple[torch.Tensor, torch.Tensor], _: int) -> torch.Tensor:
+        x, y = batch
+        loss = torch.nn.functional.mse_loss(self(x), y)
+        self.log("val_loss", loss, prog_bar=True)
+        return loss
+
+    def configure_optimizers(self) -> torch.optim.Optimizer:
+        return torch.optim.Adam(self.parameters())
+
+    def predict_step(self, x: torch.Tensor, _: int) -> torch.Tensor:
+        return self(x)
+
+
+class iTransformer(LightningBaseModel):
+    """Inverted Transformer baseline (Liu et al., 2024).
+
+    Treats each variate as a token and applies attention across the variate dimension. Most directly relevant to the
+    multivariate framing of STARIXNet — answers whether modelling cross-variate dependencies via attention beats the
+    per-variate Conv1d pooling used in STARIXNet's autoregressive and exogenous decoders.
+    """
+
+    def __init__(
+        self,
+        d_model: int = 128,
+        n_heads: int = 4,
+        n_layers: int = 3,
+        dropout: float = 0.0,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.n_layers = n_layers
+        self.dropout = dropout
+
+    def _build(self) -> None:
+        self._model = _iTransformerNet(
+            input_size=self._total_input_size,
+            endog_size=self._endog_size,
+            lagged_steps=self.lagged_steps,
+            prediction_length=self._prediction_length,
+            d_model=self.d_model,
+            n_heads=self.n_heads,
+            n_layers=self.n_layers,
+            dropout=self.dropout,
+        )
+
+    def get_config(self) -> dict[str, Any]:
+        config = super().get_config()
+        config.update(
+            {
+                "d_model": self.d_model,
+                "n_heads": self.n_heads,
+                "n_layers": self.n_layers,
+                "dropout": self.dropout,
             }
         )
         return config
