@@ -262,6 +262,10 @@ class STARIXNet(BaseModel):
         exog_filters: int | list[int] | None = None,
         exog_filters_growth: int = 1,
         exog_kernel_size: int | None = None,
+        ar_encoder: str = "conv",
+        ar_d_model: int = 16,
+        ar_nhead: int = 4,
+        ar_dim_feedforward: int | None = None,
         applied_attributes: list[str] | None = None,
         **kwargs: Any,
     ) -> None:
@@ -289,6 +293,14 @@ class STARIXNet(BaseModel):
                 groups are present).
             exog_filters_growth: Growth ratio across exogenous hidden layers.
             exog_kernel_size: Kernel size for the exogenous Conv1d. Defaults to ``min(50, (lagged_steps + 1) // 2)``.
+            ar_encoder: Backbone for the autoregressive decoder; one of ``"conv"`` (Conv1d + AdaptivePool — default,
+                lightweight, fixed receptive field) or ``"transformer"`` (self-attention over the differenced lagged
+                window — heavier per step but able to attend non-uniformly across the window). Exog stays Conv1d in
+                either case; see ``PAPER_NOTES.md`` §Transformer encoder.
+            ar_d_model: Token embedding dimension used when ``ar_encoder="transformer"``. Ignored otherwise.
+            ar_nhead: Number of attention heads when ``ar_encoder="transformer"``; must divide ``ar_d_model``.
+            ar_dim_feedforward: Hidden width of each transformer block's feed-forward sub-layer. Defaults to
+                ``2 * ar_d_model`` (kept small to preserve the lightweight envelope).
             applied_attributes: Subset of ``SUPPORTED_ATTRIBUTES`` to build. Defaults to all four.
             **kwargs: Forwarded to :class:`BaseModel`.
         """
@@ -299,6 +311,11 @@ class STARIXNet(BaseModel):
         unknown = set(applied_attributes) - set(self.SUPPORTED_ATTRIBUTES)
         if unknown:
             raise ValueError(f"unknown attributes: {sorted(unknown)}")
+
+        if ar_encoder not in {"conv", "transformer"}:
+            raise ValueError(f"ar_encoder must be 'conv' or 'transformer', got {ar_encoder!r}")
+        if ar_encoder == "transformer" and ar_d_model % ar_nhead != 0:
+            raise ValueError(f"ar_d_model={ar_d_model} must be divisible by ar_nhead={ar_nhead}")
 
         self.n_temporal_embeddings = n_temporal_embeddings
         self.embedding_dim = embedding_dim
@@ -316,6 +333,10 @@ class STARIXNet(BaseModel):
         self.exog_filters = exog_filters
         self.exog_filters_growth = exog_filters_growth
         self.exog_kernel_size = exog_kernel_size
+        self.ar_encoder = ar_encoder
+        self.ar_d_model = ar_d_model
+        self.ar_nhead = ar_nhead
+        self.ar_dim_feedforward = ar_dim_feedforward if ar_dim_feedforward is not None else 2 * ar_d_model
         self.applied_attributes = list(applied_attributes)
 
         self._freqs: list[float] = []
@@ -489,6 +510,10 @@ class STARIXNet(BaseModel):
                 "exog_filters": self.exog_filters,
                 "exog_filters_growth": self.exog_filters_growth,
                 "exog_kernel_size": self.exog_kernel_size,
+                "ar_encoder": self.ar_encoder,
+                "ar_d_model": self.ar_d_model,
+                "ar_nhead": self.ar_nhead,
+                "ar_dim_feedforward": self.ar_dim_feedforward,
                 "applied_attributes": self.applied_attributes,
                 "_freqs": self._freqs,
                 "_params": self._params,
@@ -586,6 +611,13 @@ class STARIXNet(BaseModel):
         self._decoder_labels.append("temporal")
 
     def _build_autoregression_decoder(self) -> None:
+        if self.ar_encoder == "transformer":
+            self._build_autoregression_transformer_decoder()
+        else:
+            self._build_autoregression_conv_decoder()
+        self._decoder_labels.append("autoregressive")
+
+    def _build_autoregression_conv_decoder(self) -> None:
         self._moduls["ar_hlayers"] = nn.ModuleDict()
         input_dim = self.lagged_steps - 1  # -1 for differencing
         output_dim = self.forecast_steps
@@ -618,7 +650,48 @@ class STARIXNet(BaseModel):
                 nn.Linear(input_dim, self.forecast_steps) for _ in range(self._endog_size)
             )
             self._forward_logic["autoregressive"] = self._forward_autoregression_univariate
-        self._decoder_labels.append("autoregressive")
+
+    def _build_autoregression_transformer_decoder(self) -> None:
+        # n_ar_hidden_layers is reused as the depth of the transformer stack; nn.TransformerEncoder needs >= 1 block.
+        n_layers = max(1, self.n_ar_hidden_layers)
+        seq_len = self.lagged_steps - 1  # post-differencing length
+
+        self._moduls["ar_pos_embed"] = nn.Embedding(seq_len, self.ar_d_model)
+
+        if self.fit_multivariate:
+            self._moduls["ar_input_proj"] = nn.Linear(self._endog_size, self.ar_d_model)
+            layer = nn.TransformerEncoderLayer(
+                d_model=self.ar_d_model,
+                nhead=self.ar_nhead,
+                dim_feedforward=self.ar_dim_feedforward,
+                dropout=0.0,
+                batch_first=True,
+            )
+            self._moduls["ar_transformer"] = nn.TransformerEncoder(layer, num_layers=n_layers)
+            self._moduls["ar_output_proj"] = nn.Linear(self.ar_d_model, self._endog_size)
+            self._moduls["ar_output"] = nn.AdaptiveAvgPool1d(self.forecast_steps)
+            self._forward_logic["autoregressive"] = self._forward_autoregression_transformer_multivariate
+        else:
+            self._moduls["ar_input_projs"] = nn.ModuleList(
+                nn.Linear(1, self.ar_d_model) for _ in range(self._endog_size)
+            )
+            self._moduls["ar_transformers"] = nn.ModuleList(
+                nn.TransformerEncoder(
+                    nn.TransformerEncoderLayer(
+                        d_model=self.ar_d_model,
+                        nhead=self.ar_nhead,
+                        dim_feedforward=self.ar_dim_feedforward,
+                        dropout=0.0,
+                        batch_first=True,
+                    ),
+                    num_layers=n_layers,
+                )
+                for _ in range(self._endog_size)
+            )
+            self._moduls["ar_output"] = nn.ModuleList(
+                nn.Linear(self.ar_d_model, self.forecast_steps) for _ in range(self._endog_size)
+            )
+            self._forward_logic["autoregressive"] = self._forward_autoregression_transformer_univariate
 
     def _build_exogenous_decoder(
         self,
@@ -734,6 +807,31 @@ class STARIXNet(BaseModel):
             h = self._moduls["ar_hlayers"][f"pool_{hl + 1}"](h)
         h = self._moduls["ar_hlayers"][f"conv_{last_hl + 2}"](h)
         h = self._moduls["ar_output"](h).transpose(1, 2)  # (B, T, C)
+        y = torch.cat([(x_a[:, -1:, :] + h[:, :1, :]), h[:, 1:, :]], dim=1)
+        return torch.cumsum(y, dim=1)
+
+    def _forward_autoregression_transformer_univariate(self, x_a: torch.Tensor) -> torch.Tensor:
+        diff = x_a[:, 1:, :] - x_a[:, :-1, :]  # (B, T-1, C)
+        positions = torch.arange(diff.shape[1], device=diff.device)
+        pos = self._moduls["ar_pos_embed"](positions).unsqueeze(0)  # (1, T-1, d_model)
+        per_target: list[torch.Tensor] = []
+        for c in range(self._endog_size):
+            tok = self._moduls["ar_input_projs"][c](diff[:, :, c : c + 1]) + pos
+            tok = self._moduls["ar_transformers"][c](tok)
+            head = self._moduls["ar_output"][c](tok.mean(dim=1))  # pool over time, then project
+            per_target.append(head.unsqueeze(-1))
+        y = torch.cat(per_target, dim=-1)
+        y = torch.cat([(x_a[:, -1:, :] + y[:, :1, :]), y[:, 1:, :]], dim=1)
+        return torch.cumsum(y, dim=1)
+
+    def _forward_autoregression_transformer_multivariate(self, x_a: torch.Tensor) -> torch.Tensor:
+        diff = x_a[:, 1:, :] - x_a[:, :-1, :]  # (B, T-1, C)
+        positions = torch.arange(diff.shape[1], device=diff.device)
+        pos = self._moduls["ar_pos_embed"](positions).unsqueeze(0)  # (1, T-1, d_model)
+        h = self._moduls["ar_input_proj"](diff) + pos  # (B, T-1, d_model)
+        h = self._moduls["ar_transformer"](h)
+        h = self._moduls["ar_output_proj"](h).transpose(1, 2)  # (B, C, T-1)
+        h = self._moduls["ar_output"](h).transpose(1, 2)  # (B, forecast_steps, C)
         y = torch.cat([(x_a[:, -1:, :] + h[:, :1, :]), h[:, 1:, :]], dim=1)
         return torch.cumsum(y, dim=1)
 
