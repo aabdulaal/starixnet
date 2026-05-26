@@ -1,651 +1,685 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
+"""Benchmark forecasting models implemented directly in PyTorch + Lightning.
+
 Copyright (c) Walmart Inc.
 
-This source code is licensed under the Apache 2.0 license found in the
-LICENSE file in the root directory of this source tree.
+This source code is licensed under the Apache 2.0 license found in the LICENSE file in the root directory of this source
+tree.
 """
 
+from __future__ import annotations
+
 from io import BytesIO
-from typing import Any, Dict, List, Optional, Tuple, Union
-from typing_extensions import Self  # TODO: if only using py311 or later, Self can be in base typing
+from typing import Any, Self
 from zipfile import ZIP_DEFLATED, ZipFile
 
-from joblib import dump, load
-from lightning.pytorch import Trainer
-from lightning.pytorch.callbacks import EarlyStopping
-from pytorch_forecasting import (
-    AutoRegressiveBaseModelWithCovariates,
-    DeepAR,
-    DistributionLoss,
-    MultiLoss,
-    NormalDistributionLoss,
-    QuantileLoss,
-    RecurrentNetwork,
-    RMSE,
-    TemporalFusionTransformer,
-    TimeSeriesDataSet
-)
-from statsmodels.tsa.statespace.sarimax import SARIMAX, SARIMAXResults
-from torch.utils.data.dataloader import DataLoader
+import lightning.pytorch as pl
 import numpy as np
 import pandas as pd
 import torch
+from joblib import dump, load
+from lightning.pytorch.callbacks import EarlyStopping
+from statsmodels.tsa.statespace.sarimax import SARIMAX, SARIMAXResults
+from torch import nn
+from torch.utils.data import DataLoader, TensorDataset
 
-from starixnet.models import BaseModel
+from starixnet.models import BaseModel, ExogFrames, _is_multi_exog
+from starixnet.utilities import make_seq2seq_windows
+
+# -------------------------------------------------------------------------------------------------------------------- #
+# Shared encoder/decoder sequence preparation                                                                          #
+# -------------------------------------------------------------------------------------------------------------------- #
 
 
-class PFBaseModel(BaseModel):
-    def __init__(self, **kwargs):
+class LightningBaseModel(BaseModel):
+    """Base for the deep-learning benchmarks (LSTM, DeepAR, TFT).
+
+    Provides sequence preparation, Lightning training orchestration, and save/load via a zip archive (joblib config +
+    ``state_dict``).
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        # forecast_steps + 1 buffer when skipping current step; the buffer's first prediction is discarded at output.
+        self._prediction_length = self.forecast_steps + (1 if self.skip_current_step else 0)
+        self._model: pl.LightningModule | None = None
+        self._dataset: dict[str, Any] | None = None
+        self._exog_as_unknown_reals: bool = False
+
+    # ------------------------------------------------------------------------------------------------------------ utils
+
+    @property
+    def _total_input_size(self) -> int:
+        """Number of channels in the model's per-step input vector."""
+        if self._exog_as_unknown_reals and self._exog_size:
+            extra = sum(self._exog_size) if isinstance(self._exog_size, list) else self._exog_size
+            return self._endog_size + extra
+        return self._endog_size
+
+    def _stack_exog(self, exog: ExogFrames | None) -> pd.DataFrame | None:
+        if exog is None:
+            return None
+        if _is_multi_exog(exog):
+            return pd.concat(exog, axis=1)
+        return exog
+
+    def _build_windows(
+        self,
+        endog: pd.DataFrame,
+        exog: pd.DataFrame | None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return ``(encoder, decoder)`` windowed arrays with shapes
+        ``(N, lagged_steps, channels)`` and ``(N, prediction_length, endog_size)``.
         """
-        Base model class for `pytorch-forecasting` auto-regressive models.
+        endog_x, endog_y, _ = make_seq2seq_windows(
+            endog,
+            lagged_steps=self.lagged_steps,
+            forecast_steps=self._prediction_length,
+            lagged_features=endog.columns.to_list(),
+            skip_current_step=False,  # buffer step handled via _prediction_length
+        )
 
-        Args:
-            **kwargs: Additional arguments to pass to `starixnet.models.BaseModel` base model class.
-        """
-        super(PFBaseModel, self).__init__(**kwargs)
-        self.time_varying_unknown_reals: Optional[List[str]] = None
-        self._model: Optional[AutoRegressiveBaseModelWithCovariates] = None
+        encoder = endog_x.to_numpy(dtype=np.float32).reshape(
+            -1,
+            self.lagged_steps,
+            self._endog_size,
+        )
+        decoder = endog_y.to_numpy(dtype=np.float32).reshape(
+            -1,
+            self._prediction_length,
+            self._endog_size,
+        )
 
-        # hack for skipping a buffer time-step during prediction
-        self._prediction_length = self.forecast_steps + 1 if self.skip_current_step else self.forecast_steps
-        # TODO: Ideally modify the loss-fn to skipp the buffer time-step
+        if self._exog_as_unknown_reals and exog is not None:
+            exog_x, _, _ = make_seq2seq_windows(
+                exog,
+                lagged_steps=self.lagged_steps,
+                forecast_steps=self._prediction_length,
+                lagged_features=exog.columns.to_list(),
+                skip_current_step=False,
+            )
+            exog_arr = exog_x.to_numpy(dtype=np.float32).reshape(
+                -1,
+                self.lagged_steps,
+                exog.shape[1],
+            )
+            encoder = np.concatenate([encoder, exog_arr], axis=-1)
 
-        # hack for saving the model and loading it from dataset
-        self._dataset: Optional[TimeSeriesDataSet] = None
+        return encoder, decoder
+
+    def _build_predict_windows(
+        self,
+        endog: pd.DataFrame,
+        exog: pd.DataFrame | None,
+    ) -> np.ndarray:
+        """Sliding-window encoder array for prediction (no decoder targets)."""
+        encoder_only = make_seq2seq_windows(
+            endog,
+            lagged_steps=self.lagged_steps,
+            forecast_steps=0,
+            lagged_features=endog.columns.to_list(),
+            return_x_only=True,
+        )
+        encoder = encoder_only.to_numpy(dtype=np.float32).reshape(
+            -1,
+            self.lagged_steps,
+            self._endog_size,
+        )
+        if self._exog_as_unknown_reals and exog is not None:
+            exog_only = make_seq2seq_windows(
+                exog,
+                lagged_steps=self.lagged_steps,
+                forecast_steps=0,
+                lagged_features=exog.columns.to_list(),
+                return_x_only=True,
+            )
+            exog_arr = exog_only.to_numpy(dtype=np.float32).reshape(
+                -1,
+                self.lagged_steps,
+                exog.shape[1],
+            )
+            encoder = np.concatenate([encoder, exog_arr], axis=-1)
+        return encoder
+
+    # ----------------------------------------------------------------------------------------------------------- public
 
     def fit(
         self,
         endog: pd.DataFrame,
-        exog: Optional[Union[pd.DataFrame, List[pd.DataFrame]]] = None,
+        exog: ExogFrames | None = None,
         batch_size: int = 32,
         epochs: int = 100,
         shuffle: bool = True,
         early_stopping_patience: int = -1,
         validation_split: float = 0.0,
-        sample_weights: Optional[pd.DataFrame] = None,
+        sample_weights: pd.DataFrame | None = None,
         exog_as_unknown_reals: bool = False,
-        gradient_clip_val: Optional[float] = None,
-        **kwargs,
-    ) -> Tuple[TimeSeriesDataSet, DataLoader, Optional[DataLoader], Trainer]:
-        """
-        Perform preliminary preparations for model training.
-
-        Args:
-            endog (pd.DataFrame): Target time series (i.e. signals).
-            exog (Optional[Union[pd.DataFrame, List[pd.DataFrame]]], optional): eXogenous time series to fit targets. If
-                not provided, the network will produce seasonal, temporal, and autoregressive-based forecasts only. If a
-                List of dataframes is provided, then separte encoders and decoders will be built for each data frame.
-                Defaults to None.
-            batch_size (int, optional): Samples per batch to load. Defaults to 32.
-            epochs (int, optional): Number of training passes. Defaults to 100.
-            shuffle (bool, optional): Whether to reshuffle the data for every epoch. Defaults to True.
-            early_stopping_patience (int, optional):  Number of epochs with no improvement after which training will be
-                stopped. If passing through all epochs is desired, then this value should be set to -1. Defaults to -1.
-            validation_split (float, optional): Ratio of data to be used for validation. If no validation required, this
-                value should be 0.0. It is recommended to utilize validation specially when applying early stopping.
-                Defaults to 0.0.
-            sample_weights (Optional[pd.DataFrame], optional): Univariate time series of weights to bias the training
-                samples. Defaults to None.
-            exog_as_unknown_reals (bool, optional): Whether to set `exog` as the `time_varying_unknown_reals` parameter
-                in the `TimeSeriesDataSet` object from the `pytorch_forecasting` library. Note that this works only for
-                some models. Defaults to False
-            gradient_clip_val (Optional[float], optional): The value at which to clip gradients. Defaults to None.
-
-        Returns:
-            (Tuple[pd.DataFrame, Optional[pd.DataFrame]]): Input time series after perofrming optional checks.
-        """
-        # inspect and register data/metadata
+        gradient_clip_val: float | None = None,
+        **kwargs: Any,
+    ) -> Self:
         endog, exog = super().fit(endog, exog=exog, **kwargs)
-
-        # normalize
+        self._exog_as_unknown_reals = exog_as_unknown_reals
         endog, exog = self._preprocess_fit(endog, exog)._preprocess_transform(endog, exog)
 
-        # format columns
-        endog, exog = PFBaseModel._format_columns(endog, exog)
+        exog_stacked = self._stack_exog(exog)
+        encoder, decoder = self._build_windows(endog, exog_stacked)
 
-        # prepare dataset
-        self.time_varying_unknown_reals = endog.columns.to_list()
-        if exog is not None:
-            if isinstance(exog, list):
-                data = pd.concat([endog] + exog, axis=1)
-                if exog_as_unknown_reals:
-                    self.time_varying_unknown_reals += [c for _exog in exog for c in _exog.columns]
-            else:
-                data = pd.concat([endog, exog], axis=1)
-                if exog_as_unknown_reals:
-                    self.time_varying_unknown_reals += exog.columns.to_list()
-        else:
-            data = endog
-        data['timestamp'] = endog.index  # this is already scaled during transformations
-        data['constant'] = 1
-        data = data.reset_index(drop=True)  # in case the index name conflicts with a column name
-
-        # prepare pytorch dataloader
         if validation_split > 0.0:
-            cutoff = data['timestamp'].iloc[round(validation_split * endog.shape[0])]
+            cutoff = max(1, round(validation_split * encoder.shape[0]))
+            train_enc, val_enc = encoder[:-cutoff], encoder[-cutoff:]
+            train_dec, val_dec = decoder[:-cutoff], decoder[-cutoff:]
         else:
-            cutoff = data['timestamp'].iloc[-1]
-        training = TimeSeriesDataSet(
-            data[lambda x: x['timestamp'] <= cutoff],
-            'timestamp',  # column of time index
-            endog.columns.to_list(),   # columns of prediction targets
-            ['constant'],  # group ids identifying multiple time-series instances (for long dataframe)
-            max_encoder_length=self.lagged_steps,
-            max_prediction_length=self._prediction_length,
-            time_varying_known_reals=['timestamp'],
-            time_varying_unknown_reals=self.time_varying_unknown_reals,
+            train_enc, val_enc = encoder, None
+            train_dec, val_dec = decoder, None
+
+        train_loader = DataLoader(
+            TensorDataset(torch.from_numpy(train_enc), torch.from_numpy(train_dec)),
+            batch_size=batch_size,
+            shuffle=shuffle,
         )
-        train_dataloader = training.to_dataloader(train=True, batch_size=batch_size, shuffle=shuffle)
-        if validation_split > 0.0:
-            validation = TimeSeriesDataSet.from_dataset(training, data, predict=True,)
-            val_dataloader = validation.to_dataloader(train=False, batch_size=batch_size, shuffle=shuffle)
-        else:
-            val_dataloader = None
+        val_loader = (
+            DataLoader(
+                TensorDataset(torch.from_numpy(val_enc), torch.from_numpy(val_dec)),
+                batch_size=batch_size,
+                shuffle=False,
+            )
+            if val_enc is not None
+            else None
+        )
 
-        # store minimal dataset sample for saving and loading
-        self._dataset = TimeSeriesDataSet(
-            data.iloc[-(self.lagged_steps + self._prediction_length):],
-            'timestamp',  # column of time index
-            endog.columns.to_list(),   # columns of prediction targets
-            ['constant'],  # group ids identifying multiple time-series instances (for long dataframe)
-            max_encoder_length=self.lagged_steps,
-            max_prediction_length=self._prediction_length,
-            time_varying_known_reals=['timestamp'],
-            time_varying_unknown_reals=self.time_varying_unknown_reals,
-        )  # TODO: repetitive function, should be abstracted
+        # save a minimal sample for later reconstruction in load_model
+        self._dataset = {
+            "encoder_sample": encoder[-1:].copy(),
+            "decoder_sample": decoder[-1:].copy(),
+            "input_size": self._total_input_size,
+            "endog_size": self._endog_size,
+        }
 
-        # prepare trainer
-        if early_stopping_patience > 0:
-            callbacks = [
+        if self._model is None:
+            self._build()
+
+        callbacks: list[pl.Callback] = []
+        if early_stopping_patience > 0 and val_loader is not None:
+            callbacks.append(
                 EarlyStopping(
-                    monitor="val_loss", min_delta=1e-4, patience=early_stopping_patience, verbose=False, mode="min"
+                    monitor="val_loss",
+                    min_delta=1e-4,
+                    patience=early_stopping_patience,
+                    mode="min",
                 )
-            ]
-        else:
-            callbacks = False
-        trainer = Trainer(
-            accelerator="cpu", callbacks=callbacks, max_epochs=epochs, gradient_clip_val=gradient_clip_val,
-        )
-
-        return training, train_dataloader, val_dataloader, trainer
-
-    def predict(
-        self, endog: pd.DataFrame, exog: Optional[Union[pd.DataFrame, List[pd.DataFrame]]] = None, batch_size: int = 32,
-    ) -> np.ndarray:
-        """
-        Forecast future steps from input steps.
-
-        Args:
-            endog (pd.DataFrame): Input past time series of the target(s).
-            exog (Optional[Union[pd.DataFrame, List[pd.DataFrame]]], optional): Input past time series of the exogenous
-                signals. Defaults to None.
-            batch_size (int, optional): Samples per batch to load. Currently, this is ignored. Defaults to 32.
-
-        Returns:
-            np.ndarray: Aggregated forecasts in a 3d array: (no. of input sequences X future steps X no. of targets).
-        """
-        predict_dataloader = self._get_predict_dataloader(endog, exog=exog, batch_size=batch_size)
-
-        # obtain predictions
-        y_preds = [torch.Tensor() for target in range(self._endog_size)]
-        for x, y in predict_dataloader:
-            y_preds_temp = self._model.forward(x)['prediction']
-            y_preds = [
-                torch.cat((y_pred, y_pred_temp[:, -self.forecast_steps:, :]), dim=0)
-                for y_pred, y_pred_temp in zip(y_preds, y_preds_temp)
-            ]  # returns list of (samples:timesteps:target) for each target
-
-        return self._postprocess_predictions(y_preds)
-
-    def save(self, filepath: Union[str, BytesIO], compress: bool = True,) -> None:
-        """
-        Save model to file or memory bytes.
-
-        Args:
-            filepath (Union[str, BytesIO]): Path for storing model file. Can also be stored in memory bytes.
-            compress (bool, optional): Whether to compress and reduce file size. Defaults to True.
-        """
-        # create in-memory zip file
-        zip_buffer = BytesIO()
-        with ZipFile(zip_buffer, "w", ZIP_DEFLATED) as zipf:
-            # save config file
-            config_file = self.get_config()
-            config_file_bytes = BytesIO()  # create memory bytes
-            dump(config_file, config_file_bytes, compress=compress)  # hold in memory
-            zipf.writestr("config_file.z", config_file_bytes.getvalue())
-
-            # save model state
-            model_state_bytes = BytesIO()  # create memory bytes
-            torch.save(self._model.state_dict(), model_state_bytes)  # hold in memory
-            zipf.writestr("model_state.z", model_state_bytes.getvalue())
-
-        # Save zipped archive from memory
-        dump(zip_buffer.getvalue(), filepath, compress=compress)
-
-    def get_config(self) -> Dict[str, Any]:
-        """
-        Extract model configuration (i.e. parameters, variables, attributes, and settings).
-
-        Returns:
-            Dict[str, Any]: Dictionary of all instance variables and their values.
-        """
-        config = super().get_config()
-        config.update(
-            {
-                "time_varying_unknown_reals": self.time_varying_unknown_reals,
-                "_prediction_length": self._prediction_length,
-                "_dataset": self._dataset,
-            }
-        )
-        return config
-
-    @staticmethod
-    def _format_columns(
-        endog: pd.DataFrame, exog: Optional[Union[pd.DataFrame, List[pd.DataFrame]]] = None,
-    ) -> Tuple[pd.DataFrame, Optional[Union[pd.DataFrame, List[pd.DataFrame]]]]:
-        if isinstance(endog.columns, pd.core.indexes.multi.MultiIndex):
-            endog.columns = endog.columns.map('&'.join)
-            if exog is not None:
-                if isinstance(exog, list):
-                    for _exog in exog:
-                        _exog.columns = _exog.columns.map('&'.join)
-                else:
-                    exog.columns = exog.columns.map('&'.join)
-        return endog, exog
-
-    def _param_check(self):
-        for param in self.parameters():
-            assert not torch.isnan(param).any().numpy(), (
-                "Training corrupted: Found NaN value in neural network parameters. "
-                "Please check all training inputs and configuration for errors"
             )
 
-    def _get_predict_dataloader(
-        self, endog: pd.DataFrame, exog: Optional[Union[pd.DataFrame, List[pd.DataFrame]]] = None, batch_size: int = 32,
-    ) -> DataLoader:
-        assert all([f in endog.columns for f in self._endog_labels]), (
-            "one or more features are missing from the endog dataframe"
+        trainer = pl.Trainer(
+            accelerator="cpu",
+            callbacks=callbacks,
+            max_epochs=epochs,
+            gradient_clip_val=gradient_clip_val,
+            enable_checkpointing=False,
+            logger=False,
+            enable_model_summary=False,
         )
-        endog = endog[self._endog_labels]
-        if exog is not None:
-            if isinstance(exog, list):
-                for i, _exog in enumerate(exog):
-                    assert all([f in _exog.columns for f in self._exog_labels[i]]), (
-                        f"one or more features are missing from the exog_{i} dataframe"
-                    )
-                    exog[i] = _exog[self._exog_labels[i]]
-            else:
-                assert all([f in exog.columns for f in self._exog_labels]), (
-                    "one or more features are missing from the exog dataframe"
-                )
-                exog = exog[self._exog_labels]
+        trainer.fit(self._model, train_dataloaders=train_loader, val_dataloaders=val_loader)
 
-        # normalize
+        self._assert_no_nan_params()
+        return self
+
+    def predict(
+        self,
+        endog: pd.DataFrame,
+        exog: ExogFrames | None = None,
+        batch_size: int = 32,
+    ) -> np.ndarray:
+        endog = self._select_endog_columns(endog)
+        exog = self._select_exog_columns(exog)
         endog, exog = self._preprocess_transform(endog, exog)
+        exog_stacked = self._stack_exog(exog)
 
-        # format columns
-        endog, exog = PFBaseModel._format_columns(endog, exog)
+        encoder = self._build_predict_windows(endog, exog_stacked)
+        loader = DataLoader(TensorDataset(torch.from_numpy(encoder)), batch_size=batch_size, shuffle=False)
 
-        # prepare encoder dataset
-        if exog is not None:
-            if isinstance(exog, list):
-                encoder_data = pd.concat([endog] + exog, axis=1)
-            else:
-                encoder_data = pd.concat([endog, exog], axis=1)
-        else:
-            encoder_data = endog
-        encoder_data['timestamp'] = endog.index  # this is already scaled during transformations
-        encoder_data['constant'] = 1  # TODO: shouldn't be constant if multiple separate predictions are needed
-        encoder_data = encoder_data.reset_index(drop=True)  # in case the index name conflicts with a column name
+        self._model.eval()
+        chunks: list[np.ndarray] = []
+        with torch.no_grad():
+            for (batch,) in loader:
+                preds = self._model.predict_step(batch, self._prediction_length)
+                chunks.append(preds.cpu().numpy()[:, -self.forecast_steps :, :])
+        return self._inverse_transform(np.concatenate(chunks, axis=0))
 
-        # create future time steps (decoder dataset)
-        predict_timestamp = encoder_data['timestamp'].iloc[-1] + 1
-        prediction_data = pd.DataFrame({
-            "timestamp": range(predict_timestamp, predict_timestamp + self._prediction_length),
-            'constant': 1
-        })
-        # return encoder_data, prediction_data
+    def save(self, filepath: str | BytesIO, compress: bool = True) -> None:
+        zip_buffer = BytesIO()
+        with ZipFile(zip_buffer, "w", ZIP_DEFLATED) as zf:
+            config_buf = BytesIO()
+            dump(self.get_config(), config_buf, compress=compress)
+            zf.writestr("config_file.z", config_buf.getvalue())
 
-        # prepare pytorch dataloader
-        combined = pd.concat([encoder_data, prediction_data], ignore_index=True).fillna(0.0)  # dummy 0 to avoid error
-        prediction = TimeSeriesDataSet(
-            combined,
-            'timestamp',  # column of time index
-            endog.columns.to_list(),   # columns of prediction targets
-            ['constant'],  # group ids identifying multiple time-series instances (for long dataframe)
-            max_encoder_length=self.lagged_steps,
-            max_prediction_length=self._prediction_length,
-            time_varying_known_reals=['timestamp'],
-            time_varying_unknown_reals=self.time_varying_unknown_reals,
-        )
-        return prediction.to_dataloader(train=False, batch_size=batch_size, shuffle=False)
+            state_buf = BytesIO()
+            torch.save(self._model.state_dict(), state_buf)
+            zf.writestr("model_state.z", state_buf.getvalue())
+        dump(zip_buffer.getvalue(), filepath, compress=compress)
 
-    def _postprocess_predictions(self, y_preds: List[torch.Tensor]) -> np.ndarray:
-        # concatenate tensors to return (samples:timesteps:targets)
-        y_preds = torch.cat(y_preds, dim=-1)
-
-        # inverse transform
-        y_preds = np.clip(
-            (
-                (y_preds.detach().cpu().numpy() - self.minmaxscaler_range[0]) /
-                (self.minmaxscaler_range[1] - self.minmaxscaler_range[0])
-            ) * (
-                self._endog_scalers[1] - self._endog_scalers[0]
-            ).values + self._endog_scalers[0].values, 0, np.inf
-        )  # TODO: make this an _inverse_transform method and make it output dataframes as the input
-
-        return y_preds
-
-
-class LSTM(PFBaseModel):
-    def __init__(self, hidden_size: int = 1, rnn_layers: int = 1, dropout: float = 0.0, **kwargs,):
-        """
-        LSTM followed by output layer.
-
-        Args:
-            hidden_size (int, optional): Hidden recurrent size. Source suggests 10. Defaults to 1.
-            rnn_layers (int, optional): Number of RNN layers. Source suggests 2. Defaults to 1.
-            dropout (float, optional): Dropout in RNN layers. Source siggests 0.1. Defaults to 0.0.
-            **kwargs: Additional arguments to pass to `PFBaseModel` base model class.
-        """
-        super(LSTM, self).__init__(**kwargs)
-        self.hidden_size = hidden_size
-        self.rnn_layers = rnn_layers
-        self.dropout = dropout
-
-        self._model: Optional[RecurrentNetwork] = None
-
-    def _build(self, training: TimeSeriesDataSet,) -> Self:
-        self._model = RecurrentNetwork.from_dataset(
-            training,
-            cell_type='LSTM',
-            hidden_size=self.hidden_size,
-            rnn_layers=self.rnn_layers,
-            dropout=self.dropout,
-            loss=RMSE(),  # instead of QuantileLoss([loss_q])
-            optimizer='adam',
-        )
-        return self
-
-    def fit(self, *args, **kwargs) -> Self:
-        # prepare for training data using  base model
-        training, train_dataloader, val_dataloader, trainer = super().fit(*args, **kwargs)
-
-        # build network (if not already built)
-        if self._model is None:
-            self._build(training)
-
-        # train
-        trainer.fit(self._model, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader,)
-
-        # check
-        self._param_check()
-
-        return self
-
-    def get_config(self) -> Dict[str, Any]:
-        """
-        Extract model configuration (i.e. parameters, variables, attributes, and settings).
-
-        Returns:
-            Dict[str, Any]: Dictionary of all instance variables and their values.
-        """
+    def get_config(self) -> dict[str, Any]:
         config = super().get_config()
         config.update(
             {
-                "hidden_size": self.hidden_size,
-                "rnn_layers": self.rnn_layers,
-                "dropout": self.dropout,
+                "_prediction_length": self._prediction_length,
+                "_dataset": self._dataset,
+                "_exog_as_unknown_reals": self._exog_as_unknown_reals,
             }
         )
         return config
 
     @classmethod
-    def load_model(cls, filepath: Union[str, BytesIO],) -> Self:
-        """
-        Load LSTM from file or memory bytes.
-
-        Args:
-            filepath (Union[str, BytesIO]): Path of stored model file. Can also be memory bytes.
-
-        Returns:
-            LSTM: Loaded neural network.
-        """
-        # initialize empty class
-        cls = cls(0)
-
-        # load components from zipped file
+    def _load_archive(cls, filepath: str | BytesIO) -> tuple[Self, dict[str, Any]]:
+        """Hydrate config and return ``(instance, state_dict)`` for subclasses."""
+        instance = cls(0)
         zipped_bytes = load(filepath)
-        zip_buffer = BytesIO(zipped_bytes)
-        with ZipFile(zip_buffer, "r") as zipf:
-            # load and set config
-            config_file = load(BytesIO(zipf.read("config_file.z")))
-            for param, val in config_file.items():
-                setattr(cls, param, val)
+        with ZipFile(BytesIO(zipped_bytes), "r") as zf:
+            config = load(BytesIO(zf.read("config_file.z")))
+            for param, val in config.items():
+                setattr(instance, param, val)
+            state_dict = torch.load(BytesIO(zf.read("model_state.z")), weights_only=True)
+        return instance, state_dict
 
-            # load model state and set model
-            model_state = torch.load(BytesIO(zipf.read("model_state.z")))
-            cls._model = RecurrentNetwork.from_dataset(
-                cls._dataset,
-                cell_type='LSTM',
-                hidden_size=cls.hidden_size,
-                rnn_layers=cls.rnn_layers,
-                dropout=cls.dropout,
-                loss=RMSE(),  # instead of QuantileLoss([loss_q])
-                optimizer='adam',
-            )  # TODO: repetitive function, should be abstracted
-            cls._model.load_state_dict(model_state)
+    def _select_endog_columns(self, endog: pd.DataFrame) -> pd.DataFrame:
+        missing = [f for f in self._endog_labels if f not in endog.columns]
+        if missing:
+            raise ValueError(f"endog is missing required columns: {missing}")
+        return endog[self._endog_labels]
 
-        return cls
+    def _select_exog_columns(self, exog: ExogFrames | None) -> ExogFrames | None:
+        if exog is None:
+            return None
+        if _is_multi_exog(exog):
+            selected: list[pd.DataFrame] = []
+            for i, frame in enumerate(exog):
+                missing = [f for f in self._exog_labels[i] if f not in frame.columns]
+                if missing:
+                    raise ValueError(f"exog group {i} is missing required columns: {missing}")
+                selected.append(frame[self._exog_labels[i]])
+            return selected
+        missing = [f for f in self._exog_labels if f not in exog.columns]
+        if missing:
+            raise ValueError(f"exog is missing required columns: {missing}")
+        return exog[self._exog_labels]
+
+    def _assert_no_nan_params(self) -> None:
+        for param in self._model.parameters():
+            if torch.isnan(param).any():
+                raise RuntimeError(
+                    "Training corrupted: NaN found in network parameters. Inspect inputs and configuration."
+                )
+
+    def _build(self) -> None:  # pragma: no cover - overridden
+        raise NotImplementedError
 
 
-class DeepVAR(PFBaseModel):
+# -------------------------------------------------------------------------------------------------------------------- #
+# LSTM                                                                                                                 #
+# -------------------------------------------------------------------------------------------------------------------- #
+
+
+class _LSTMNet(pl.LightningModule):
+    """Encoder LSTM + linear projection over the prediction horizon."""
+
+    def __init__(
+        self,
+        input_size: int,
+        endog_size: int,
+        hidden_size: int,
+        rnn_layers: int,
+        dropout: float,
+        prediction_length: int,
+    ) -> None:
+        super().__init__()
+        self.endog_size = endog_size
+        self.prediction_length = prediction_length
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=rnn_layers,
+            dropout=dropout if rnn_layers > 1 else 0.0,
+            batch_first=True,
+        )
+        self.head = nn.Linear(hidden_size, endog_size * prediction_length)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        _, (h, _) = self.lstm(x)
+        flat = self.head(h[-1])
+        return flat.view(-1, self.prediction_length, self.endog_size)
+
+    def training_step(self, batch: tuple[torch.Tensor, torch.Tensor], _: int) -> torch.Tensor:
+        x, y = batch
+        loss = torch.nn.functional.mse_loss(self(x), y)
+        self.log("train_loss", loss, prog_bar=True)
+        return loss
+
+    def validation_step(self, batch: tuple[torch.Tensor, torch.Tensor], _: int) -> torch.Tensor:
+        x, y = batch
+        loss = torch.nn.functional.mse_loss(self(x), y)
+        self.log("val_loss", loss, prog_bar=True)
+        return loss
+
+    def configure_optimizers(self) -> torch.optim.Optimizer:
+        return torch.optim.Adam(self.parameters())
+
+    def predict_step(self, x: torch.Tensor, _: int) -> torch.Tensor:
+        return self(x)
+
+
+class LSTM(LightningBaseModel):
+    """LSTM encoder followed by a single linear projection over the horizon."""
+
     def __init__(
         self,
         hidden_size: int = 1,
         rnn_layers: int = 1,
         dropout: float = 0.0,
-        loss: Union[DistributionLoss, MultiLoss] = NormalDistributionLoss(),  # TODO: make str to load from yaml
-        **kwargs,
-    ):
-        """
-        Deep (Variational) AutoRegressive Network.
-
-        Args:
-            hidden_size (int, optional): Hidden recurrent size. Source suggests 10. Defaults to 1.
-            rnn_layers (int, optional): Number of RNN layers. Source suggests 2. Defaults to 1.
-            dropout (float, optional): Dropout in RNN layers. Source siggests 0.1. Defaults to 0.0.
-            loss (Union[DistributionLoss, MultiLoss], optional): Distribution loss function. By using a Multivariate
-                Loss such as the `MultivariateNormalDistributionLoss`, the network is converted into a variational
-                (DeepVAR) network. Otherwise, the network becomes a normal-probabilistic (DeepAR) network. Defaults to
-                `NormalDistributionLoss()`.
-            **kwargs: Additional arguments to pass to `PFBaseModel` base model class.
-        """
-        super(DeepVAR, self).__init__(**kwargs)
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
         self.hidden_size = hidden_size
         self.rnn_layers = rnn_layers
         self.dropout = dropout
-        self.loss = loss
 
-        self._model: Optional[DeepAR] = None
-
-    def _build(self, training: TimeSeriesDataSet,) -> Self:
-        if self._endog_size > 1 or isinstance(training.target, (list, tuple)):
-            self.loss = MultiLoss([self.loss] * self._endog_size)  # must provide loss for each target
-        self._model = DeepAR.from_dataset(
-            training,
-            cell_type='LSTM',
+    def _build(self) -> None:
+        self._model = _LSTMNet(
+            input_size=self._total_input_size,
+            endog_size=self._endog_size,
             hidden_size=self.hidden_size,
             rnn_layers=self.rnn_layers,
             dropout=self.dropout,
-            loss=self.loss,
-            optimizer='adam',
+            prediction_length=self._prediction_length,
         )
-        return self
 
-    def fit(self, *args, **kwargs) -> Self:
-        # prepare for training data using  base model
-        training, train_dataloader, val_dataloader, trainer = super().fit(*args, **kwargs)
-
-        # build network (if not already built)
-        if self._model is None:
-            self._build(training)
-
-        # train
-        trainer.fit(self._model, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader,)
-
-        # check
-        self._param_check()
-
-        return self
-
-    def predict(
-        self, endog: pd.DataFrame, exog: Optional[Union[pd.DataFrame, List[pd.DataFrame]]] = None, batch_size: int = 32,
-    ) -> np.ndarray:
-        """
-        Forecast future steps from input steps.
-
-        Args:
-            endog (pd.DataFrame): Input past time series of the target(s).
-            exog (Optional[Union[pd.DataFrame, List[pd.DataFrame]]], optional): Input past time series of the exogenous
-                signals. Defaults to None.
-            batch_size (int, optional): Samples per batch to load. Defaults to 32.
-
-        Returns:
-            np.ndarray: Aggregated forecasts in a 3d array: (no. of input sequences X future steps X no. of targets).
-        """
-        predict_dataloader = super()._get_predict_dataloader(endog, exog=exog, batch_size=batch_size)
-        y_preds = self._model.predict(predict_dataloader, mode="prediction")
-        y_preds = [y_pred[:, -self.forecast_steps:].unsqueeze(-1) for y_pred in y_preds]  # remove buffer and make 3d
-        return super()._postprocess_predictions(y_preds)
-
-    def get_config(self) -> Dict[str, Any]:
-        """
-        Extract model configuration (i.e. parameters, variables, attributes, and settings).
-
-        Returns:
-            Dict[str, Any]: Dictionary of all instance variables and their values.
-        """
+    def get_config(self) -> dict[str, Any]:
         config = super().get_config()
         config.update(
             {
                 "hidden_size": self.hidden_size,
                 "rnn_layers": self.rnn_layers,
                 "dropout": self.dropout,
-                "loss": self.loss,
             }
         )
         return config
 
     @classmethod
-    def load_model(cls, filepath: Union[str, BytesIO],) -> Self:
+    def load_model(cls, filepath: str | BytesIO) -> Self:
+        instance, state_dict = cls._load_archive(filepath)
+        instance._build()
+        instance._model.load_state_dict(state_dict)
+        return instance
+
+
+# -------------------------------------------------------------------------------------------------------------------- #
+# DeepAR                                                                                                               #
+# -------------------------------------------------------------------------------------------------------------------- #
+
+
+class _DeepARNet(pl.LightningModule):
+    """Probabilistic LSTM with per-step Gaussian outputs (DeepAR style)."""
+
+    def __init__(
+        self,
+        input_size: int,
+        endog_size: int,
+        hidden_size: int,
+        rnn_layers: int,
+        dropout: float,
+        prediction_length: int,
+    ) -> None:
+        super().__init__()
+        self.endog_size = endog_size
+        self.prediction_length = prediction_length
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=rnn_layers,
+            dropout=dropout if rnn_layers > 1 else 0.0,
+            batch_first=True,
+        )
+        # outputs (mu, log_sigma) per target
+        self.mu_head = nn.Linear(hidden_size, endog_size)
+        self.log_sigma_head = nn.Linear(hidden_size, endog_size)
+
+    def _step_distribution(self, h: torch.Tensor) -> torch.distributions.Normal:
+        mu = self.mu_head(h)
+        sigma = torch.nn.functional.softplus(self.log_sigma_head(h)) + 1e-6
+        return torch.distributions.Normal(mu, sigma)
+
+    def forward(
+        self,
+        encoder: torch.Tensor,
+        future_steps: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Autoregressively roll out ``future_steps`` predictions.
+
+        Returns ``(mu, sigma)`` each shaped ``(B, future_steps, endog_size)``. The last observed step's exogenous
+        channels (if any) are carried forward unchanged at every rollout step.
         """
-        Load DeepVAR from file or memory bytes.
+        _, state = self.lstm(encoder)
+        last_step = encoder[:, -1:, :]  # (B, 1, input_size)
+        has_exog = last_step.shape[-1] > self.endog_size
+        exog_tail = last_step[:, :, self.endog_size :] if has_exog else None
 
-        Args:
-            filepath (Union[str, BytesIO]): Path of stored model file. Can also be memory bytes.
+        mus, sigmas = [], []
+        for _ in range(future_steps):
+            h, state = self.lstm(last_step, state)
+            dist = self._step_distribution(h[:, -1, :])
+            mus.append(dist.mean.unsqueeze(1))
+            sigmas.append(dist.stddev.unsqueeze(1))
+            next_endog = dist.mean.unsqueeze(1)
+            last_step = torch.cat([next_endog, exog_tail], dim=-1) if has_exog else next_endog
+        return torch.cat(mus, dim=1), torch.cat(sigmas, dim=1)
 
-        Returns:
-            DeepVAR: Loaded neural network.
-        """
-        # initialize empty class
-        cls = cls(0)
+    def training_step(self, batch: tuple[torch.Tensor, torch.Tensor], _: int) -> torch.Tensor:
+        x, y = batch
+        mu, sigma = self(x, y.shape[1])
+        dist = torch.distributions.Normal(mu, sigma)
+        loss = -dist.log_prob(y).mean()
+        self.log("train_loss", loss, prog_bar=True)
+        return loss
 
-        # load components from zipped file
-        zipped_bytes = load(filepath)
-        zip_buffer = BytesIO(zipped_bytes)
-        with ZipFile(zip_buffer, "r") as zipf:
-            # load and set config
-            config_file = load(BytesIO(zipf.read("config_file.z")))
-            for param, val in config_file.items():
-                setattr(cls, param, val)
+    def validation_step(self, batch: tuple[torch.Tensor, torch.Tensor], _: int) -> torch.Tensor:
+        x, y = batch
+        mu, sigma = self(x, y.shape[1])
+        dist = torch.distributions.Normal(mu, sigma)
+        loss = -dist.log_prob(y).mean()
+        self.log("val_loss", loss, prog_bar=True)
+        return loss
 
-            # load model state and set model
-            model_state = torch.load(BytesIO(zipf.read("model_state.z")))
-            cls._model = DeepAR.from_dataset(
-                cls._dataset,
-                cell_type='LSTM',
-                hidden_size=cls.hidden_size,
-                rnn_layers=cls.rnn_layers,
-                dropout=cls.dropout,
-                loss=cls.loss,
-                optimizer='adam',
-            )  # TODO: repetitive function, should be abstracted
-            cls._model.load_state_dict(model_state)
+    def configure_optimizers(self) -> torch.optim.Optimizer:
+        return torch.optim.Adam(self.parameters())
 
-        return cls
+    def predict_step(self, x: torch.Tensor, future_steps: int) -> torch.Tensor:
+        mu, _ = self(x, future_steps)
+        return mu
 
 
-class TFT(PFBaseModel):
+class DeepAR(LightningBaseModel):
+    """Probabilistic recurrent forecaster with per-step Gaussian outputs.
+
+    Implements the DeepAR family without the original ``pytorch-forecasting`` dependency. Trained by maximum likelihood
+    under a Normal observation model and rolled out autoregressively at inference.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int = 1,
+        rnn_layers: int = 1,
+        dropout: float = 0.0,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.hidden_size = hidden_size
+        self.rnn_layers = rnn_layers
+        self.dropout = dropout
+
+    def _build(self) -> None:
+        self._model = _DeepARNet(
+            input_size=self._total_input_size,
+            endog_size=self._endog_size,
+            hidden_size=self.hidden_size,
+            rnn_layers=self.rnn_layers,
+            dropout=self.dropout,
+            prediction_length=self._prediction_length,
+        )
+
+    def get_config(self) -> dict[str, Any]:
+        config = super().get_config()
+        config.update(
+            {
+                "hidden_size": self.hidden_size,
+                "rnn_layers": self.rnn_layers,
+                "dropout": self.dropout,
+            }
+        )
+        return config
+
+    @classmethod
+    def load_model(cls, filepath: str | BytesIO) -> Self:
+        instance, state_dict = cls._load_archive(filepath)
+        instance._build()
+        instance._model.load_state_dict(state_dict)
+        return instance
+
+
+# Backwards-compatible alias from the previous naming.
+DeepVAR = DeepAR
+
+
+# -------------------------------------------------------------------------------------------------------------------- #
+# TFT (pragmatic implementation)                                                                                       #
+# -------------------------------------------------------------------------------------------------------------------- #
+
+
+class _TFTNet(pl.LightningModule):
+    """Pragmatic Temporal Fusion Transformer-style decoder.
+
+    Implements the key ingredients (LSTM encoder, multi-head self-attention, quantile output, gated residual) without
+    the full variable-selection machinery of the original paper. Sufficient as a Transformer baseline that is directly
+    comparable to STARIXNet.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        endog_size: int,
+        hidden_size: int,
+        lstm_layers: int,
+        dropout: float,
+        quantiles: list[float],
+        prediction_length: int,
+        n_attention_heads: int = 4,
+    ) -> None:
+        super().__init__()
+        self.endog_size = endog_size
+        self.prediction_length = prediction_length
+        self.quantiles = quantiles
+        self.n_quantiles = len(quantiles)
+        # ensure hidden dim divisible by heads
+        head_dim = max(1, hidden_size // n_attention_heads)
+        self.hidden_size = head_dim * n_attention_heads
+
+        self.input_proj = nn.Linear(input_size, self.hidden_size)
+        self.lstm = nn.LSTM(
+            input_size=self.hidden_size,
+            hidden_size=self.hidden_size,
+            num_layers=lstm_layers,
+            dropout=dropout if lstm_layers > 1 else 0.0,
+            batch_first=True,
+        )
+        self.attention = nn.MultiheadAttention(
+            self.hidden_size,
+            num_heads=n_attention_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.norm = nn.LayerNorm(self.hidden_size)
+        self.feed_forward = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size * 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.hidden_size * 2, self.hidden_size),
+        )
+        self.norm2 = nn.LayerNorm(self.hidden_size)
+        # produces quantile outputs per target over the full horizon
+        self.head = nn.Linear(self.hidden_size, endog_size * prediction_length * self.n_quantiles)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.input_proj(x)
+        h, _ = self.lstm(h)
+        attn_out, _ = self.attention(h, h, h, need_weights=False)
+        h = self.norm(h + attn_out)
+        h = self.norm2(h + self.feed_forward(h))
+        # take the last time step as the decoder context
+        out = self.head(h[:, -1, :])
+        return out.view(-1, self.prediction_length, self.endog_size, self.n_quantiles)
+
+    def _quantile_loss(self, preds: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        # preds: (B, T, C, Q); target: (B, T, C)
+        quantiles = torch.tensor(self.quantiles, device=preds.device, dtype=preds.dtype)
+        error = target.unsqueeze(-1) - preds
+        loss = torch.maximum(quantiles * error, (quantiles - 1.0) * error)
+        return loss.mean()
+
+    def training_step(self, batch: tuple[torch.Tensor, torch.Tensor], _: int) -> torch.Tensor:
+        x, y = batch
+        loss = self._quantile_loss(self(x), y)
+        self.log("train_loss", loss, prog_bar=True)
+        return loss
+
+    def validation_step(self, batch: tuple[torch.Tensor, torch.Tensor], _: int) -> torch.Tensor:
+        x, y = batch
+        loss = self._quantile_loss(self(x), y)
+        self.log("val_loss", loss, prog_bar=True)
+        return loss
+
+    def configure_optimizers(self) -> torch.optim.Optimizer:
+        return torch.optim.Adam(self.parameters())
+
+    def predict_step(self, x: torch.Tensor, _: int) -> torch.Tensor:
+        preds = self(x)
+        # collapse quantile dim with the median (or central quantile)
+        mid = len(self.quantiles) // 2
+        return preds[..., mid]
+
+
+class TFT(LightningBaseModel):
+    """Temporal Fusion Transformer baseline (pragmatic reimplementation).
+
+    Captures the key TFT components — LSTM encoder, multi-head self-attention, gated residual, and quantile output —
+    without the original variable selection networks. See :class:`_TFTNet` for the architecture.
+    """
+
     def __init__(
         self,
         hidden_size: int = 1,
         lstm_layers: int = 1,
         dropout: float = 0.0,
-        quantiles: List[float] = [0.5],
-        **kwargs,
-    ):
-        """
-        Temporal Fusion Transfomer.
-
-        Args:
-            hidden_size (int, optional): hidden size of network which can range from 8 to 512. Source suggests 16.
-                Defaults to 1.
-            lstm_layers (int, optional): Number of LSTM layers. Source suggests 2 as optimal. Defaults to 1.
-            dropout (float, optional): Dropout rate. Source siggests 0.1. Defaults to 0.0.
-            quantiles (List[float], optional): Quantiles for `pytorch_forecasting.QuantileLoss` loss function. Source
-                suggests 7 quantiles (i.e. [0.02, 0.1, 0.25, 0.5, 0.75, 0.9, 0.98]). Defaults to [0.5].
-            **kwargs: Additional arguments to pass to `PFBaseModel` base model class.
-        """
-        super(TFT, self).__init__(**kwargs)
+        quantiles: list[float] | None = None,
+        n_attention_heads: int = 4,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
         self.hidden_size = hidden_size
         self.lstm_layers = lstm_layers
         self.dropout = dropout
-        self.quantiles = quantiles
-        self.output_size: Union[int, List[int]] = len(self.quantiles)
+        self.quantiles = list(quantiles) if quantiles else [0.5]
+        self.n_attention_heads = n_attention_heads
+        self.output_size: int | list[int] = len(self.quantiles)
 
-        self._model: Optional[TemporalFusionTransformer] = None
-
-    def _build(self, training: TimeSeriesDataSet,) -> Self:
-        self.output_size = len(self.quantiles) if isinstance(self.quantiles, (list, tuple)) else 1
-        if self._endog_size > 1:
-            self.output_size = [self.output_size] * self._endog_size
-        self._model = TemporalFusionTransformer.from_dataset(
-            training,
+    def _build(self) -> None:
+        self._model = _TFTNet(
+            input_size=self._total_input_size,
+            endog_size=self._endog_size,
             hidden_size=self.hidden_size,
             lstm_layers=self.lstm_layers,
             dropout=self.dropout,
-            output_size=self.output_size,
-            loss=QuantileLoss(self.quantiles),
-            optimizer='adam',
+            quantiles=self.quantiles,
+            prediction_length=self._prediction_length,
+            n_attention_heads=self.n_attention_heads,
         )
-        return self
 
-    def fit(self, *args, **kwargs) -> Self:
-        # prepare for training data using  base model
-        training, train_dataloader, val_dataloader, trainer = super().fit(*args, **kwargs)
-
-        # build network (if not already built)
-        if self._model is None:
-            self._build(training)
-
-        # train
-        trainer.fit(self._model, train_dataloaders=train_dataloader, val_dataloaders=val_dataloader,)
-
-        # check
-        self._param_check()
-
-        return self
-
-    def get_config(self) -> Dict[str, Any]:
-        """
-        Extract model configuration (i.e. parameters, variables, attributes, and settings).
-
-        Returns:
-            Dict[str, Any]: Dictionary of all instance variables and their values.
-        """
+    def get_config(self) -> dict[str, Any]:
         config = super().get_config()
         config.update(
             {
@@ -653,51 +687,32 @@ class TFT(PFBaseModel):
                 "lstm_layers": self.lstm_layers,
                 "dropout": self.dropout,
                 "quantiles": self.quantiles,
+                "n_attention_heads": self.n_attention_heads,
                 "output_size": self.output_size,
             }
         )
         return config
 
     @classmethod
-    def load_model(cls, filepath: Union[str, BytesIO],) -> Self:
-        """
-        Load TFT from file or memory bytes.
-
-        Args:
-            filepath (Union[str, BytesIO]): Path of stored model file. Can also be memory bytes.
-
-        Returns:
-            TFT: Loaded neural network.
-        """
-        # initialize empty class
-        cls = cls(0)
-
-        # load components from zipped file
-        zipped_bytes = load(filepath)
-        zip_buffer = BytesIO(zipped_bytes)
-        with ZipFile(zip_buffer, "r") as zipf:
-            # load and set config
-            config_file = load(BytesIO(zipf.read("config_file.z")))
-            for param, val in config_file.items():
-                setattr(cls, param, val)
-
-            # load model state and set model
-            model_state = torch.load(BytesIO(zipf.read("model_state.z")))
-            cls._model = TemporalFusionTransformer.from_dataset(
-                cls._dataset,
-                hidden_size=cls.hidden_size,
-                lstm_layers=cls.lstm_layers,
-                dropout=cls.dropout,
-                output_size=cls.output_size,
-                loss=QuantileLoss(cls.quantiles),
-                optimizer='adam',
-            )  # TODO: repetitive function, should be abstracted
-            cls._model.load_state_dict(model_state)
-
-        return cls
+    def load_model(cls, filepath: str | BytesIO) -> Self:
+        instance, state_dict = cls._load_archive(filepath)
+        instance._build()
+        instance._model.load_state_dict(state_dict)
+        return instance
 
 
-class SARIMA(BaseModel):  # TODO: if more statistical models will be used, then new basemodel class is needed
+# -------------------------------------------------------------------------------------------------------------------- #
+# SARIMA                                                                                                               #
+# -------------------------------------------------------------------------------------------------------------------- #
+
+
+class SARIMA(BaseModel):
+    """Seasonal ARIMA wrapper around :class:`statsmodels.tsa.statespace.SARIMAX`.
+
+    Univariate models are fit per target series. Exogenous variables are currently ignored (a future enhancement is to
+    support them as external regressors).
+    """
+
     def __init__(
         self,
         ar_order: int = 1,
@@ -707,120 +722,88 @@ class SARIMA(BaseModel):  # TODO: if more statistical models will be used, then 
         seasonal_differencing: int = 0,
         seasonal_ma_order: int = 0,
         season_length: int = 0,
-        **kwargs,
-    ):
-        """
-        Seasonal Autoregressive Integrated Moving Average models.
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.order: tuple[int, int, int] = (ar_order, differencing, ma_order)
+        self.seasonal_order: tuple[int, int, int, int] = (
+            seasonal_ar_order,
+            seasonal_differencing,
+            seasonal_ma_order,
+            season_length,
+        )
 
-        Args:
-            ar_order (int, optional): AutoRegressive (AR) terms (lag of past values). Defaults to 1.
-            differencing (int, optional): Number of times the data is differenced to make it stationary. Defaults to 1.
-            ma_order (int, optional): Moving Average (MA) terms (lag of past errors). Defaults to 0.
-            seasonal_ar_order (int, optional): 	Seasonal AR terms (lags of the seasonal period). Defaults to 0.
-            seasonal_differencing (int, optional): How many times to subtract seasonally lagged data. Defaults to 0.
-            seasonal_ma_order (int, optional): Seasonal MA terms (seasonal lags of past errors). Defaults to 0.
-            season_length (int, optional): Number of time steps per season. Defaults to 0.
-            **kwargs (TYPE): Additional arguments to pass to `PFBaseModel` base model class.
-
-        Returns:
-            None.
-
-        """
-        super(SARIMA, self).__init__(**kwargs)
-        self.order: Tuple[int] = (ar_order, differencing, ma_order)
-        self.seasonal_order: Tuple[int] = (seasonal_ar_order, seasonal_differencing, seasonal_ma_order, season_length)
-
-        self._model: Optional[Union[SARIMAX, List[SARIMAX]]] = None
-        self._res: Optional[Union[SARIMAXResults, List[SARIMAXResults]]] = None
-        self._state_timestamp: int = 0  # to record last training point from which ot start predicting from
-        self._state_size: int = 0  # to record the size of the training data used as the state
+        self._model: SARIMAX | list[SARIMAX] | None = None
+        self._res: SARIMAXResults | list[SARIMAXResults] | None = None
+        self._state_timestamp: int = 0
+        self._state_size: int = 0
         self._step_size: int = 0
-        
-        # hack for skipping a buffer time-step during prediction
-        self._prediction_length = self.forecast_steps + 1 if self.skip_current_step else self.forecast_steps
+        self._prediction_length = self.forecast_steps + (1 if self.skip_current_step else 0)
+
+    # ------------------------------------------------------------------------------------------------------------ build
 
     def _build(self, endog: pd.DataFrame) -> Self:
-        kwargs = {'order': self.order, 'seasonal_order': self.seasonal_order, "simple_differencing": False}
+        kwargs = {"order": self.order, "seasonal_order": self.seasonal_order, "simple_differencing": False}
         if self._endog_size > 1:
-            self._model = [SARIMAX(endog[label].values.reshape(-1), **kwargs,) for label in self._endog_labels]
+            self._model = [SARIMAX(endog[label].values.reshape(-1), **kwargs) for label in self._endog_labels]
         else:
-            self._model = SARIMAX(endog.values.reshape(-1), **kwargs,)
+            self._model = SARIMAX(endog.values.reshape(-1), **kwargs)
         return self
+
+    # ----------------------------------------------------------------------------------------------------------- public
 
     def fit(
         self,
         endog: pd.DataFrame,
-        exog: Optional[Union[pd.DataFrame, List[pd.DataFrame]]] = None,
+        exog: ExogFrames | None = None,
         epochs: int = 100,
         low_memory: bool = True,
-        max_state_size: Optional[int] = None,  # to limit the saved model size
-        **kwargs,
+        max_state_size: int | None = None,
+        **kwargs: Any,
     ) -> Self:
-        # ignore exog for this kind of model
-        exog = None  # TODO: potentially offset exog and use as external regressor
-
-        # inspect and register data/metadata
-        endog, exog = super().fit(endog, exog=exog, **kwargs)
-        self._state_timestamp = endog.index[-1].item()
+        endog, _ = super().fit(endog, exog=None, **kwargs)
+        self._state_timestamp = int(endog.index[-1])
         endog_size = endog.shape[0]
-        if max_state_size:
-            self._state_size = max_state_size if endog_size > max_state_size else endog_size
-        else:
-            self._state_size = endog_size
-        epochtime = endog.index.astype(int)[:2]
-        self._step_size = epochtime[1] - epochtime[0]
+        self._state_size = min(max_state_size, endog_size) if max_state_size else endog_size
+        self._step_size = int(endog.index[1] - endog.index[0])
 
-        # build model (if not already built)
         if self._model is None:
             self._build(endog)
 
-        # train
         if self._endog_size > 1:
             self._res = [
-                self._fit(
-                    model, epochs=epochs, low_memory=low_memory, max_state_size=max_state_size
-                ) for model in self._model
+                self._fit_one(model, epochs=epochs, low_memory=low_memory, trim=max_state_size is not None)
+                for model in self._model
             ]
         else:
-            self._res = self._fit(self._model, epochs=epochs, low_memory=low_memory, max_state_size=max_state_size)
-
+            self._res = self._fit_one(
+                self._model,
+                epochs=epochs,
+                low_memory=low_memory,
+                trim=max_state_size is not None,
+            )
         return self
 
     def predict(
-        self, endog: pd.DataFrame, exog: Optional[Union[pd.DataFrame, List[pd.DataFrame]]] = None,
+        self,
+        endog: pd.DataFrame,
+        exog: ExogFrames | None = None,
     ) -> np.ndarray:
-        # ignore exog for this kind of model
-        exog = None  # TODO: potentially offset exog and use as external regressor
-
-        # update model states
-        missing_state_size = int(((endog.index[0].item() - self._state_timestamp) // self._step_size) - 1)
+        missing_state_size = int(((endog.index[0] - self._state_timestamp) // self._step_size) - 1)
         if self._endog_size > 1:
             self._res = [
-                self._update_state(
-                    res, missing_state_size, endog[label], exog=exog
-                ) for res, label in zip(self._res, self._endog_labels)
+                self._update_state(res, missing_state_size, endog[label])
+                for res, label in zip(self._res, self._endog_labels, strict=True)
             ]
+            forecasts = np.concatenate([self._forecast(res) for res in self._res], axis=-1)
         else:
-            self._res = self._update_state(self._res, missing_state_size, endog, exog=exog)
-        if endog.index[-1].item() > self._state_timestamp:
-            self._state_timestamp = endog.index[-1].item()
+            self._res = self._update_state(self._res, missing_state_size, endog)
+            forecasts = self._forecast(self._res)
+        if int(endog.index[-1]) > self._state_timestamp:
+            self._state_timestamp = int(endog.index[-1])
+        return np.clip(forecasts, 0.0, np.inf)
 
-        # generate and transform predictions
-        if self._endog_size > 1:
-            y_preds = [self._get_forecasts(res) for res in self._res]
-            y_preds = np.concatenate(y_preds, axis=-1)
-        else:
-            y_preds = self._get_forecasts(self._re)
-
-        return np.clip(y_preds, 0.0, np.inf)
-
-    def get_config(self) -> Dict[str, Any]:
-        """
-        Extract model configuration (i.e. parameters, variables, attributes, and settings).
-
-        Returns:
-            Dict[str, Any]: Dictionary of all instance variables and their values.
-        """
+    def get_config(self) -> dict[str, Any]:
         config = super().get_config()
         config.update(
             {
@@ -836,80 +819,87 @@ class SARIMA(BaseModel):  # TODO: if more statistical models will be used, then 
         )
         return config
 
-    def _fit(
-        self, model: SARIMAX, epochs: int = 100, low_memory: bool = True, max_state_size: Optional[int] = None
+    @classmethod
+    def load_model(cls, filepath: str | BytesIO) -> Self:
+        instance = cls(0)
+        config = load(filepath)
+        for param, val in config.items():
+            setattr(instance, param, val)
+        return instance
+
+    # ---------------------------------------------------------------------------------------------------------- private
+
+    _RES_ARRAYS_TRAILING_KEEP = (
+        # attributes indexed as ``[-(state_size - 1):]`` along the last axis
+        "filtered_state",
+        "predicted_state",  # special-cased: keeps full state_size
+        "forecasts",
+        "forecasts_error",
+        "standardized_forecasts_error",
+        "scaled_smoothed_estimator",
+        "smoothing_error",
+        "smoothed_state",
+        "smoothed_measurement_disturbance",
+        "smoothed_state_disturbance",
+    )
+
+    def _fit_one(
+        self,
+        model: SARIMAX,
+        epochs: int,
+        low_memory: bool,
+        trim: bool,
     ) -> SARIMAXResults:
-        # train model
-        res = model.fit(maxiter=epochs, low_memory=low_memory,)
+        res = model.fit(maxiter=epochs, low_memory=low_memory)
+        if not trim:
+            return res
 
-        # reduce model size
-        if max_state_size:
-            res.data.endog = res.data.endog[-self._state_size:]
-            res.data.data.orig_endog = res.data.data.orig_endog[-self._state_size:]
-            res.states.filtered = res.states.filtered[-self._state_size:]
-            res.states.filtered_cov = res.states.filtered_cov[-self._state_size:]
-            res.states.predicted = res.states.predicted[-self._state_size:]
-            res.states.predicted_cov = res.states.predicted_cov[-self._state_size:]
-            res.states.smoothed = res.states.smoothed[-self._state_size:]
-            res.states.smoothed_cov = res.states.smoothed_cov[-self._state_size:]
-            res.filtered_state = res.filtered_state[:, -self._state_size + 1:]
-            res.filtered_state_cov = res.filtered_state_cov[:, :, -self._state_size + 1:]
-            res.predicted_state = res.predicted_state[:, -self._state_size:]
-            res.predicted_state_cov = res.predicted_state_cov[:, :, -self._state_size:]
-            res.forecasts = res.forecasts[:, -self._state_size + 1:]
-            res.forecasts_error = res.forecasts_error[:, -self._state_size + 1:]
-            res.forecasts_error_cov = res.forecasts_error_cov[:, :, -self._state_size + 1:]
-            res.standardized_forecasts_error = res.standardized_forecasts_error[:, -self._state_size + 1:]
-            res.scaled_smoothed_estimator = res.scaled_smoothed_estimator[:, -self._state_size + 1:]
-            res.scaled_smoothed_estimator_cov = res.scaled_smoothed_estimator_cov[:, :, -self._state_size + 1:]
-            res.smoothing_error = res.smoothing_error[:, -self._state_size + 1:]
-            res.smoothed_state = res.smoothed_state[:, -self._state_size + 1:]
-            res.smoothed_state_cov = res.smoothed_state_cov[:, :, -self._state_size + 1:]
-            res.smoothed_state_autocov = res.smoothed_state_autocov[:, :, -self._state_size + 1:]
-            res.smoothed_measurement_disturbance = res.smoothed_measurement_disturbance[:, -self._state_size + 1:]
-            res.smoothed_state_disturbance = res.smoothed_state_disturbance[:, -self._state_size + 1:]
-            res.smoothed_measurement_disturbance_cov = (
-                res.smoothed_measurement_disturbance_cov[:, :, -self._state_size + 1:]
-            )
-            res.smoothed_state_disturbance_cov = res.smoothed_state_disturbance_cov[:, :, -self._state_size + 1:]
-            # TODO: still need to browse and clearn res.filter_results
-            # TODO: still need to browse and clearn res.smoother_results
+        keep = self._state_size
+        keep_minus_one = max(0, keep - 1)
 
+        res.data.endog = res.data.endog[-keep:]
+        res.data.data.orig_endog = res.data.data.orig_endog[-keep:]
+
+        for attr in ("filtered", "filtered_cov", "predicted", "predicted_cov", "smoothed", "smoothed_cov"):
+            setattr(res.states, attr, getattr(res.states, attr)[-keep:])
+
+        # 2-d / 3-d state arrays
+        res.filtered_state = res.filtered_state[:, -keep_minus_one:]
+        res.filtered_state_cov = res.filtered_state_cov[:, :, -keep_minus_one:]
+        res.predicted_state = res.predicted_state[:, -keep:]
+        res.predicted_state_cov = res.predicted_state_cov[:, :, -keep:]
+
+        res.forecasts = res.forecasts[:, -keep_minus_one:]
+        res.forecasts_error = res.forecasts_error[:, -keep_minus_one:]
+        res.forecasts_error_cov = res.forecasts_error_cov[:, :, -keep_minus_one:]
+        res.standardized_forecasts_error = res.standardized_forecasts_error[:, -keep_minus_one:]
+
+        res.scaled_smoothed_estimator = res.scaled_smoothed_estimator[:, -keep_minus_one:]
+        res.scaled_smoothed_estimator_cov = res.scaled_smoothed_estimator_cov[:, :, -keep_minus_one:]
+        res.smoothing_error = res.smoothing_error[:, -keep_minus_one:]
+        res.smoothed_state = res.smoothed_state[:, -keep_minus_one:]
+        res.smoothed_state_cov = res.smoothed_state_cov[:, :, -keep_minus_one:]
+        res.smoothed_state_autocov = res.smoothed_state_autocov[:, :, -keep_minus_one:]
+        res.smoothed_measurement_disturbance = res.smoothed_measurement_disturbance[:, -keep_minus_one:]
+        res.smoothed_state_disturbance = res.smoothed_state_disturbance[:, -keep_minus_one:]
+        res.smoothed_measurement_disturbance_cov = res.smoothed_measurement_disturbance_cov[:, :, -keep_minus_one:]
+        res.smoothed_state_disturbance_cov = res.smoothed_state_disturbance_cov[:, :, -keep_minus_one:]
         return res
 
     def _update_state(
         self,
         res: SARIMAXResults,
         missing_state_size: int,
-        endog: Union[pd.DataFrame, pd.Series],
-        exog: Optional[Union[pd.DataFrame, List[pd.DataFrame]]] = None,
+        endog: pd.Series | pd.DataFrame,
     ) -> SARIMAXResults:
         if missing_state_size > 0:
-            missing_state = res.forecast(missing_state_size)  # fill missing gaps with forecasted values
-            res = res.append(missing_state)  # add missing gaps
-        elif missing_state_size < 0:  # in rare case of being recently trained that there is an overlap with endog
+            res = res.append(res.forecast(missing_state_size))
+        elif missing_state_size < 0:
             endog = endog.iloc[-missing_state_size:]
         if endog.shape[0] > 0:
-            res = res.append(endog.values.reshape(-1))   # add encoder context
-        res.data.endog = res.data.endog[-self._state_size:]  # to avoid memory leak (model can keep increasing in mem)
+            res = res.append(endog.values.reshape(-1))
+        res.data.endog = res.data.endog[-self._state_size :]
         return res
 
-    def _get_forecasts(self, res: SARIMAXResults,) -> np.ndarray:
-        return res.forecast(self._prediction_length)[-self.forecast_steps:].reshape(1, -1, 1)
-
-    @classmethod
-    def load_model(cls, filepath: Union[str, BytesIO],) -> Self:
-        """
-        Load SARIMA from file or memory bytes.
-
-        Args:
-            filepath (Union[str, BytesIO]): Path of stored model file. Can also be memory bytes.
-
-        Returns:
-            SARIMA: Loaded Seasonal Autoregressive Integrated Moving Average models.
-        """
-        file = load(filepath)
-        cls = cls(0)
-        for param, val in file.items():
-            setattr(cls, param, val)
-        return cls
+    def _forecast(self, res: SARIMAXResults) -> np.ndarray:
+        return res.forecast(self._prediction_length)[-self.forecast_steps :].reshape(1, -1, 1)

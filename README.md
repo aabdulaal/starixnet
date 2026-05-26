@@ -1,43 +1,146 @@
 # STARIXNet
 
-Neural Network for multivariate and multi-attribute time-series forecasting purposes.
+Encoder–decoder neural network for multivariate, multi-attribute time-series forecasting. The model decomposes a forecast into independent decoder branches — **S**easonal, **T**emporal, **A**uto**R**egressive **I**ntegrated, and e**X**ogenous — then aggregates them via a quantile reduction at prediction time. Benchmarks against LSTM, DeepAR, TFT, and SARIMA are included.
 
-The code is managed with Poetry for consistent builds, and tests reside in the tests directory. This setup ensures reliability and supports flexible model architectures for use in data-driven environments.
+## Repository layout
 
+```
+starixnet/      # the proposed STARIXNet model (models.py), training loop (utilities.py), and quantile loss (losses.py)
+benchmark/      # LSTM, DeepAR, TFT, and SARIMA implemented directly in PyTorch + Lightning
+tests/          # unit tests + cached test data and serialized models
+```
 
-## Maintainer(s)
+## Requirements
 
-Ahmed Abdulaal <ahmed.abdulaal@walmart.com>
+- Python ≥ 3.11
+- Either [`uv`](https://docs.astral.sh/uv/) (recommended) or plain `pip`
 
 ## Installation
 
-This project was created and managed using Poetry. the Python dependency management tool, to ensure repeatable installs and distribution-ready builds. 
+### Option 1 — `uv` (recommended)
 
-### Option 1: asdf and poetry
-
-1. Install [asdf](https://asdf-vm.com/) CLI tool
-
-2. Run `make setup` from the project root directory.
-
-### Option 2: poetry only
-
-1. Follow [poetry's official documentaton](https://python-poetry.org/docs/#osx--linux--bashonwindows-install-instructions) for installation or install with `pip install poetry`
-
-2. Run `poetry install` from the project root directory.
-
-## Testing
-
-### Unit testing
-
-All unit tests are in the tests directory. They can be run locally with `make test.unit`.
-
-# License
-
-This project is licensed under the **Apache License, Version 2.0**. See the [LICENSE](LICENSE) file for details.
-
-## Third‑Party Licenses
-
-This project uses several third‑party packages, and we include detailed licensing information for them. The third party licenses cen be generated and placed in the `/licenses` directory with following command:
 ```bash
-pip-licenses --format=json > licenses/third-party-licenses.json
+brew install uv         # or follow https://docs.astral.sh/uv/getting-started/installation/
+uv sync --extra dev     # creates .venv/ and resolves uv.lock
 ```
+
+`make setup` runs this automatically when `uv` is on the `PATH`.
+
+### Option 2 — plain `pip`
+
+`pyproject.toml` is PEP 621–compliant, so it works directly with `pip`. A pinned `requirements.txt` (exported from `uv.lock`) is committed for fully reproducible installs:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt   # pinned versions matching uv.lock
+pip install -e . --no-deps        # add the local packages
+```
+
+Or, for a non-pinned install straight from `pyproject.toml`:
+
+```bash
+pip install -e ".[dev]"
+```
+
+`make setup` falls back to the pinned-`requirements.txt` path automatically when `uv` is not available.
+
+Smoke test (either route):
+
+```bash
+python -c "from starixnet.models import STARIXNet"
+```
+
+To regenerate `requirements.txt` after editing `pyproject.toml`, run `make requirements` (requires `uv`).
+
+## Commands
+
+The Makefile auto-detects `uv`; when it's missing, it falls back to plain `pip` and assumes the venv is activated.
+
+```bash
+make setup          # uv sync --extra dev   (or pip install -r requirements.txt + -e .)
+make setup.uv       # force the uv path
+make setup.pip      # force the pip path
+make requirements   # regenerate requirements.txt from uv.lock (uv only)
+
+make test.unit      # run unit tests with coverage gate (>= 80%)
+make lints          # ruff check + ruff format --check
+make lints.fix      # ruff check --fix + ruff format
+```
+
+Invoking the tools directly works the same either way — prepend `uv run` if using uv, otherwise activate the venv first:
+
+```bash
+uv run pytest tests/test_starixnet.py -x        # uv route
+# or, with the venv activated:
+pytest tests/test_starixnet.py -x               # pip route
+```
+
+## Quick start
+
+```python
+import pandas as pd
+from starixnet.models import STARIXNet
+
+endog = pd.read_csv("data/endog.csv", index_col=[0]).interpolate()
+exog = pd.read_csv("data/exog.csv", index_col=[0]).interpolate()
+
+model = STARIXNet(
+    n_temporal_embeddings=10080,
+    enforced_periods=[10080, 1440],
+    lagged_steps=30,
+    forecast_steps=15,
+    fit_multivariate=True,
+)
+model.fit(endog, exog=exog, loss_q=0.95, epochs=50, validation_split=0.2)
+
+forecast = model.predict(endog.tail(30 + 15), exog=exog.tail(30 + 15), aggregation_q=0.5)
+# forecast.shape == (samples, forecast_steps, endog_size)
+```
+
+The `applied_attributes` argument selects which decoder branches are built:
+
+```python
+STARIXNet(..., applied_attributes=["temporal", "autoregressive"])
+```
+
+## Tutorial notebook
+
+[`notebooks/starixnet_tutorial.ipynb`](notebooks/starixnet_tutorial.ipynb) walks through the full workflow on a synthetic service-monitoring dataset (CPU / TPS / memory targets with traffic, deployment, error-rate, and network exogenous signals). It covers data generation, training, per-decoder forecast inspection, the quantile-aggregation sweep, and save/load.
+
+```bash
+# install Jupyter + matplotlib (kept out of the core dependencies)
+uv sync --extra notebook                # or: pip install -e ".[notebook]"
+uv run jupyter lab notebooks/starixnet_tutorial.ipynb
+```
+
+The notebook is regenerated from a source script (`notebooks/_build_tutorial.py`) — keeps the diff reviewable as Python rather than raw JSON.
+
+## Architecture overview
+
+| Decoder | Input | Mechanism |
+| --- | --- | --- |
+| Seasonal | scaled time index | `Σ amp·sin(freq·t + phase) + disp` with PSD-extracted frequencies |
+| Temporal | scaled time index | embedding lookup over `t mod n_temporal_embeddings` + MLP |
+| Autoregressive | differenced endog | per-target MLPs (univariate) or Conv1d + AdaptiveAvgPool (multivariate); integrated via `cumsum` |
+| Exogenous | past exog values | Conv1d + AdaptiveMaxPool (multivariate) or Conv1d + MaxPool + per-target MLPs (univariate) |
+
+Tensor convention throughout: `(samples, steps, features)`.
+
+The benchmark models in `benchmark/models.py` follow the same `fit(endog, exog, …) / predict(endog, exog)` API and are implemented directly in PyTorch + Lightning (no `pytorch-forecasting` dependency).
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE).
+
+### Third-party licenses
+
+This project depends on several third-party packages. License information can be regenerated into `licenses/` with:
+
+```bash
+uv run pip-licenses --format=json > licenses/third-party-licenses.json
+```
+
+## Maintainer
+
+Ahmed Abdulaal <ahmed.abdulaal@walmart.com>

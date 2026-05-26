@@ -1,273 +1,286 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
+"""Utility helpers for STARIXNet (data prep, quality checks, training loop).
+
 Copyright (c) Walmart Inc.
 
-This source code is licensed under the Apache 2.0 license found in the
-LICENSE file in the root directory of this source tree.
+This source code is licensed under the Apache 2.0 license found in the LICENSE file in the root directory of this source
+tree.
 """
 
-from collections.abc import Callable
-from typing import Any, Dict, List, Optional, Tuple, Union
+from __future__ import annotations
 
-from scipy.signal import find_peaks, periodogram
-from torch.optim import Optimizer
-from torch.utils.data import TensorDataset, DataLoader
-from tqdm import tqdm
+import logging
+import warnings
+from collections.abc import Callable, Iterable
+from typing import Any
 
 import numpy as np
 import pandas as pd
-import warnings
+import torch
+from scipy.signal import find_peaks, periodogram
+from torch.optim import Optimizer
+from torch.utils.data import DataLoader, TensorDataset
+from tqdm.auto import tqdm
+
+logger = logging.getLogger(__name__)
+
+Tensors = list[torch.Tensor]
+ForwardFn = Callable[[Tensors, dict[str, dict[str, Any]]], list[torch.Tensor]]
 
 
 def extract_frequencies(
-    ts: Union[pd.Series, pd.DataFrame],
+    ts: pd.Series | pd.DataFrame,
     distance: int = 60,
     min_periods: int = 3,
-    max_freqs: int = 10
-) -> List[float]:
-    """
-    Extract frequencies (i.e. periods) from time series using Power Spectral Density (PSD) analysis.
+    max_freqs: int = 10,
+) -> list[float]:
+    """Identify dominant angular frequencies via Power Spectral Density analysis.
+
+    The series is reduced to a single channel (column-wise mean for multivariate input) before the periodogram is
+    computed. Peaks are ranked by spectral power and filtered such that:
+
+    1. The peak frequency index is at least ``min_periods`` (i.e. the period fits in the series at least
+       ``min_periods`` times).
+    2. The implied period exceeds ``distance``.
 
     Args:
-        ts (Union[pd.Series, pd.DataFrame]): The time series to inspect for resonant frequencies. Can be multivariate.
-        distance (int, optional): Minimal horizontal distance (>= 1) in samples between neighbouring peaks. Refer to
-            `scipy.signal.find_peaks` documentation for more information. Defaults to 60.
-        min_periods (int, optional): Minimum number of oscillations required for a frequency to be selected. Defaults to
-            3.
-        max_freqs (int, optional): Maximum dominant periods (i.e. frequencies) to select. Defaults to 10.
+        ts: Time series to inspect. Multivariate input is averaged column-wise.
+        distance: Minimum horizontal distance (in samples) between neighbouring peaks; passed to
+            :func:`scipy.signal.find_peaks`.
+        min_periods: Minimum number of oscillations required for a frequency to qualify.
+        max_freqs: Maximum number of dominant frequencies to return.
 
     Returns:
-        List[float]: A list of the identified peak frequencies.
-
+        Angular frequencies (``2π·f``) sorted by descending spectral power. May
+        be empty if no qualifying peaks are found.
     """
-    if isinstance(ts, pd.DataFrame):
-        z = ts.mean(axis=1)
-    else:
-        z = ts.copy()
+    series = ts.mean(axis=1) if isinstance(ts, pd.DataFrame) else ts.copy()
 
-    freqs, psd = periodogram(z, fs=1.0, window='hann', scaling='density')
-    peak_idxs = find_peaks(psd, distance=distance, height=(0, np.inf))[0]
-    peak_order = psd[peak_idxs].argsort()[-min_periods-max_freqs:][::-1]
-    peak_idxs = peak_idxs[peak_order]
-    if peak_idxs[0] < min_periods:
-        print(
-            'No common oscillations found. '
-            'Either the series does not exhibit periodic patterns or consider reducing min_periods.'
+    freqs, psd = periodogram(series, fs=1.0, window="hann", scaling="density")
+    peak_idxs, _ = find_peaks(psd, distance=distance, height=(0, np.inf))
+    if peak_idxs.size == 0:
+        logger.info("No peaks identified in PSD; no seasonal frequencies extracted.")
+        return []
+
+    # rank peaks by descending power
+    ranked = peak_idxs[np.argsort(psd[peak_idxs])[::-1]]
+
+    # require at least `min_periods` oscillations (i.e. peak idx >= min_periods)
+    qualifying = ranked[ranked >= min_periods]
+    if qualifying.size == 0:
+        logger.info(
+            "Common oscillations do not satisfy min_periods=%d. Reduce min_periods or use a longer series.",
+            min_periods,
         )
-        freqs = []
-    elif max(peak_idxs[:min_periods]) >= min_periods:
-        idxs = peak_idxs[peak_idxs >= min_periods]
-        peak_freqs = [freqs[idx] for idx in idxs[:min(len(idxs), max_freqs)]]
-        freqs = [2 * np.pi * f for f in peak_freqs]
-        print(f'Found common oscillations at period(s) = {[1 / f for f in peak_freqs]}')
-        freqs = [freqs[i] for i in range(max_freqs) if 1 / peak_freqs[i] > distance]  # Only periods > distance
-    else:
-        print(
-            f'Common oscillations found do not satisfy the min_periods={min_periods} requirement. '
-            'Consider reducing the min_periods parameter or increase the length of the time series.'
-        )
-        freqs = []
-    return freqs
+        return []
+
+    qualifying = qualifying[:max_freqs]
+    peak_freqs = freqs[qualifying]
+    # filter periods that exceed the peak-separation distance
+    keep = (1.0 / peak_freqs) > distance
+    peak_freqs = peak_freqs[keep]
+    if peak_freqs.size == 0:
+        logger.info("All qualifying peaks have periods <= distance=%d; returning empty.", distance)
+        return []
+
+    logger.info("Found common oscillations at period(s) = %s", (1.0 / peak_freqs).tolist())
+    return (2.0 * np.pi * peak_freqs).tolist()
 
 
-def minmaxscaler(
-    df: pd.DataFrame, scalers: Tuple[pd.DataFrame], scaling_range: Tuple[float, float] = (0.0, 1.0)
+def minmax_scale(
+    df: pd.DataFrame,
+    scalers: tuple[pd.Series, pd.Series],
+    scaling_range: tuple[float, float] = (0.0, 1.0),
 ) -> pd.DataFrame:
-    """
-    Apply minmax normalization
+    """Vectorized min-max normalization with NaN/inf handling.
 
     Args:
-        df (pd.DataFrame): Raw dataframe.
-        scalers (Tuple[pd.DataFrame]): Scalers (min and max) values of the dataframe columns.
-        scaling_range (Tuple[float, float], optional): Desired range of scaled data. Defaults to (0.0, 1.0)
+        df: Raw frame.
+        scalers: Tuple of ``(min, max)`` per column, typically ``(df.min(), df.max())`` captured at fit time.
+        scaling_range: Target range ``(lo, hi)`` for the normalized output.
 
     Returns:
-        (pd.DataFrame): scaled (normalized) dataframe.
-
+        Normalized frame; columns with zero range become 0.0.
     """
-    return (
-        (df - scalers[0]) / (scalers[1] - scalers[0])
-    ).replace(np.inf, np.nan).fillna(0.0) * (scaling_range[1] - scaling_range[0]) + scaling_range[0]
+    lo, hi = scaling_range
+    scaled = (df - scalers[0]) / (scalers[1] - scalers[0])
+    return scaled.replace(np.inf, np.nan).fillna(0.0) * (hi - lo) + lo
 
 
-def tscheck(
+def check_signal_quality(
     ts: pd.DataFrame,
     min_range_tol: float = 0.05,
-    period: Optional[int] = None,
+    period: int | None = None,
     min_med_tol: float = 5.0,
     drop: bool = False,
-) -> List[Union[str, Tuple[str]]]:
-    """
-    Time series signal quality checks for training SARIXNet.
+) -> list[str | tuple[str, ...]]:
+    """Quality checks for time-series signals prior to training.
+
+    Three checks are run per column:
+
+    1. **Static** — flat signals (``min == max``) are rejected.
+    2. **Spread** — non-zero range less than ``min_range_tol`` (relative).
+    3. **Drift** — when ``period`` is given, an IQR ratio of the rolling median exceeding ``min_med_tol`` indicates
+       distribution drift.
 
     Args:
-        ts (pd.DataFrame): Time series to inspect for quality issues.
-        min_range_tol (float, optional): Minimum tolerance (in percentage) for inspecting the spread (i.e. range) of a
-            time series signal. Defaults to 0.05.
-        period (Optional[int], optional): Maximumm seasonality in a time series for computing the rolling median. If
-            not provided, the time series is assumed nonstationary and rolling distribution checks will be skipped.
-            Defaults to None.
-        min_med_tol (float, optional): Minimum tolerance for inspecting distribution inconsistencies over time for a
-            time series. Defaults to 5.0.
-        drop (bool, optional): Whether to drop signals failing the quality checks. Defaults to False.
-
-    Raises:
-        ValueError: If time series is too static or impacted by significant data drift.
+        ts: Frame to inspect.
+        min_range_tol: Minimum relative range tolerance for non-zero values.
+        period: Window for rolling-median drift detection. Skipped if ``None``.
+        min_med_tol: Maximum allowed Q75/Q25 ratio of the rolling median.
+        drop: If True, emit a warning and return failing columns; otherwise raise.
 
     Returns:
-        List[Union[str, Tuple[str]]]: List of time series features failing the checks.
+        Columns that failed at least one check (empty when ``drop=False`` and no failure occurred — an exception is
+        raised on failure instead).
 
+    Raises:
+        ValueError: If ``drop=False`` and any column fails a check.
+        AssertionError: If every column is flagged for removal.
     """
-    dropped_features = []
-    for f in ts.columns:
-        f_min, f_max = ts[f].min(), ts[f].max()
+    dropped: list[str | tuple[str, ...]] = []
 
-        # check for static signals
-        if not f_max > f_min:
-            if drop:
-                warnings.warn(
-                    f"{f} signal appears static, it will be dropped from the dataset. "
-                    "For future runs, consider removing it beforehand"
-                )
-                dropped_features.append(f)
+    def _flag(column: str | tuple[str, ...], message: str) -> bool:
+        """Return True to continue to next column; False to keep this column."""
+        if drop:
+            warnings.warn(message + " It will be dropped from the dataset.", stacklevel=2)
+            dropped.append(column)
+            return True
+        raise ValueError(message)
+
+    for col in ts.columns:
+        series = ts[col]
+        s_min, s_max = series.min(), series.max()
+
+        if not s_max > s_min and _flag(col, f"{col!r} signal appears static."):
+            continue
+
+        nonzero = series[series.abs() > 0.0]
+        if not nonzero.empty:
+            min_nonzero = nonzero.min()
+            if abs((s_max - min_nonzero) / min_nonzero) < min_range_tol and _flag(
+                col, f"{col!r} non-zero range is below min_range_tol={min_range_tol}."
+            ):
                 continue
-            else:
-                raise ValueError(f"{f} signal appears static, consider dropping it from the dataset and retry")
 
-        # check for minimum deviation
-        min_nonzero = (ts[f][ts[f].abs() > 0.0]).min()
-        if abs((f_max - min_nonzero) / min_nonzero) < min_range_tol:
-            if drop:
-                warnings.warn(
-                    f"The non-zero values range of {f} signal is less than the allowed tolerance, "
-                    f"{f} will be dropped from the dataset. For future runs, consider removing it beforehand"
-                )
-                dropped_features.append(f)
+        if period is not None:
+            rol_med = series.rolling(period).median()
+            q25, q75 = rol_med.quantile(0.25), rol_med.quantile(0.75)
+            if q25 == 0.0:
+                q25 = rol_med[rol_med > 0.0].min()
+            if (
+                q25
+                and q75 / q25 > min_med_tol
+                and _flag(col, f"{col!r} rolling-median drift exceeds min_med_tol={min_med_tol}.")
+            ):
                 continue
-            else:
-                raise ValueError(
-                    f"The non-zero values range of {f} signal is less than the allowed tolerance, "
-                    f"consider dropping {f} from the dataset and retry"
-                )
 
-        # check for rolling median (faster than calculating MAD)
-        if period:
-            rol_med = ts[f].rolling(period).median()
-            rol_med_q75, rol_med_q25 = rol_med.quantile(0.75), rol_med.quantile(0.25)
-            if rol_med_q25 == 0.0:
-                rol_med_q25 = rol_med[rol_med > 0.0].min()
-            if rol_med_q75 / rol_med_q25 > min_med_tol:
-                if drop:
-                    warnings.warn(
-                        f"The distribution of {f} signal appears to have shifted over its seasonal period more than the"
-                        f" allowed tolerance, {f} will be dropped from the dataset. For future, consider either "
-                        f"inspecting the signal for data mining errors or removing it beforehand"
-                    )
-                    dropped_features.append(f)
-                    continue
-                else:
-                    raise ValueError(
-                        f"The distribution of {f} signal appears to have shifted over its seasonal period more than the"
-                        f" allowed tolerance, consider correcting or removing {f} from the dataset and retry"
-                    )
-    assert len(dropped_features) < len(ts.columns), "all signals have been dropped due to failing quality checks"
-    return dropped_features
+    if dropped and len(dropped) >= len(ts.columns):
+        raise AssertionError("all signals failed quality checks; nothing left to train on")
+    return dropped
 
 
-def ts2xyseq(
+def make_seq2seq_windows(
     ts: pd.DataFrame,
     lagged_steps: int,
     forecast_steps: int,
-    lagged_features: List[str],
-    forecast_features: Optional[List[str]] = None,
+    lagged_features: list[str],
+    forecast_features: list[str] | None = None,
     skip_current_step: bool = True,
     return_x_only: bool = False,
-    ts_weights: Optional[pd.DataFrame] = None,
-) -> Union[Tuple[pd.DataFrame], pd.DataFrame]:
-    """
-    Convert time series into a seq-to-seq (i.e. regressors:targets) format for ML training (i.e. x, and y).
+    ts_weights: pd.DataFrame | None = None,
+) -> pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame | None]:
+    """Convert a time-series frame into seq-to-seq (lagged ↔ future) format.
 
     Args:
-        ts (pd.DataFrame): Time series to convert into sequence format.
-        lagged_steps (int): Number of lagged steps (i.e. regressors) in the seq-to-seq format.
-        forecast_steps (int): Number of future steps (i.e. targets) in the seq-to-seq format.
-        lagged_features (List[str]): Number of signals (i.e. features) in the input time series.
-        forecast_features (Optional[List[str]], optional): Number of signals (i.e. features) in the output time series.
-         If not provided, the number of input and output signals is assumed constant. Defaults to None.
-        skip_current_step (bool, optional): Whether to skip step (t=0) when converting the time series to a
-            seq-to-seq format. For example, assuming `lagged_steps=2` and `forecast_steps=2`, if True, then the
-            regressor:target becomes t-2,t-1:t+1,t+2, otherwise it becomes t-2,t-1:t,t+1.. Defaults to True.
-        return_x_only (bool, optional): Whether to convert only for regressors (i.e. input sequence). Defaults to False.
-        ts_weights (Optional[pd.DataFrame], optional): Univariate time series of sample weights for the target time
-            series. If provided, the sample weights would require coversion to the sequence format as well. Defaults to
-            None.
+        ts: Wide-format frame indexed by time.
+        lagged_steps: Number of past steps to use as regressors.
+        forecast_steps: Number of future steps to predict.
+        lagged_features: Columns used as lagged regressors.
+        forecast_features: Columns used as forecast targets. Defaults to ``lagged_features``.
+        skip_current_step: If True, future starts at ``t+1`` (regressor uses steps ``t-L..t-1``); else starts at ``t``.
+        return_x_only: When True, only the regressor frame is returned.
+        ts_weights: Optional univariate frame of per-step sample weights aligned to ``ts``. When supplied the
+            future-window weights are returned.
 
     Returns:
-        Union[Tuple[pd.DataFrame], pd.DataFrame]: Tuple containing the input sequences (i.e. x), output sequences (i.e.
-        y), and the sample weight sequencies (if provided). If `return_x_only=True`, only the input sequences are
-        returned.
+        Regressor frame if ``return_x_only`` else a 3-tuple of ``(x, y, weights)`` where ``weights`` is ``None`` when
+        ``ts_weights`` is ``None``.
     """
-    # TODO: Consider using multiprocessing for larger datasets, although generators are pretty fast as well
     skip_t = int(skip_current_step)
-    if not forecast_features:
-        forecast_features = lagged_features
-    lagged_ts = pd.concat({'t': ts[lagged_features]}, axis=1)
-    lagged_ts_gen = (lagged_ts.shift(i).rename({'t': f't-{i}'}, axis=1) for i in range(1, lagged_steps + 1))
+    forecast_features = forecast_features or lagged_features
+
+    x = _stacked_shifts(
+        ts[lagged_features],
+        lags=range(1, lagged_steps + 1),
+        sign="-",
+    )
+    x_cols = [f"t-{i}" for i in reversed(range(1, lagged_steps + 1))]
+    x = x[x_cols]
+
     if return_x_only:
-        return pd.concat(
-            list(lagged_ts_gen), axis=1
-        )[[f't-{i}' for i in reversed(range(1, lagged_steps + 1))]].iloc[lagged_steps:]
-    else:
-        forecast_ts = pd.concat({'t': ts[forecast_features]}, axis=1)
-        forecast_ts_gen = (
-            forecast_ts.shift(-i).rename({'t': f't+{i}'}, axis=1) for i in range(skip_t, forecast_steps + skip_t)
-        )
-        if ts_weights is not None:
-            forecast_ts_weights = pd.concat({'t': ts_weights}, axis=1)
-            forecast_ts_weights_gen = (
-                forecast_ts_weights.shift(-i).rename({'t': f't+{i}'}, axis=1) for i in range(
-                    skip_t, forecast_steps + skip_t
-                )
-            )
-            forecast_ts_weights = pd.concat(
-                list(forecast_ts_weights_gen), axis=1
-            )[[f't+{i}' for i in range(skip_t, forecast_steps + skip_t)]].iloc[lagged_steps:-forecast_steps]
-        else:
-            forecast_ts_weights = None
-        return (
-            pd.concat(
-                list(lagged_ts_gen), axis=1
-            )[[f't-{i}' for i in reversed(range(1, lagged_steps + 1))]].iloc[lagged_steps:-forecast_steps],
-            pd.concat(
-                list(forecast_ts_gen), axis=1
-            )[[f't+{i}' for i in range(skip_t, forecast_steps + skip_t)]].iloc[lagged_steps:-forecast_steps],
-            forecast_ts_weights
-        )
+        return x.iloc[lagged_steps:]
+
+    y = _stacked_shifts(
+        ts[forecast_features],
+        lags=range(skip_t, forecast_steps + skip_t),
+        sign="+",
+    )
+    y_cols = [f"t+{i}" for i in range(skip_t, forecast_steps + skip_t)]
+    y = y[y_cols]
+
+    w = None
+    if ts_weights is not None:
+        w = _stacked_shifts(ts_weights, lags=range(skip_t, forecast_steps + skip_t), sign="+")
+        w = w[y_cols].iloc[lagged_steps:-forecast_steps]
+
+    return (
+        x.iloc[lagged_steps:-forecast_steps],
+        y.iloc[lagged_steps:-forecast_steps],
+        w,
+    )
+
+
+def _stacked_shifts(
+    frame: pd.DataFrame,
+    lags: Iterable[int],
+    sign: str,
+) -> pd.DataFrame:
+    """Stack shifted copies of ``frame`` column-wise, naming each block ``t{sign}i``."""
+    shift_sign = -1 if sign == "+" else 1
+    grouped = pd.concat({"t": frame}, axis=1)
+    blocks = (grouped.shift(shift_sign * i).rename({"t": f"t{sign}{i}"}, axis=1) for i in lags)
+    return pd.concat(list(blocks), axis=1)
 
 
 class Trainer:
+    """Multi-decoder training loop with optional validation and early stopping.
+
+    The forward function is expected to return a list of decoder outputs, one per element in ``criteria`` /
+    ``decoder_labels``. Losses are summed across decoders before backpropagation, and an epoch-running mean is shown
+    in the progress bar.
+    """
+
     def __init__(
         self,
         optimizer: Optimizer,
-        forward_fn: Callable,
-        criteria: List[Callable],
-        decoder_labels: List[str],
+        forward_fn: ForwardFn,
+        criteria: list[Callable[..., torch.Tensor]],
+        decoder_labels: list[str],
         epochs: int = 100,
         early_stopping_patience: int = -1,
-    ):
-        """
-        Custimizable training module for SARIXNet model.
+    ) -> None:
+        """Initialize the trainer.
 
         Args:
-            optimizer (Optimizer): Optimizer from the pytorch library. Refer to `torch.optim` documentation for options.
-            forward_fn (Callable): Forward pass function for computing the loss.
-            criteria (List[Callable]): Loss functions for the decoders, in order of the decoders.
-            decoder_labels (List[str]): Labels of the output decoders in order.
-            epochs (int, optional): Number of training passes. Defaults to 100.
-            early_stopping_patience (int, optional):  Number of epochs with no improvement after which training will be
-                stopped. If passing through all epochs is desired, then this value should be set to -1. Defaults to -1.
+            optimizer: PyTorch optimizer (typically ``torch.optim.Adam``).
+            forward_fn: Callable mapping ``(tensor_list, kwargs)`` to a list of decoder predictions.
+            criteria: Loss callables, one per decoder.
+            decoder_labels: Names of decoders (for progress reporting).
+            epochs: Maximum number of training passes.
+            early_stopping_patience: Patience in epochs for val-loss plateaus; ``<= 0`` disables early stopping.
         """
+        if len(criteria) != len(decoder_labels):
+            raise ValueError(f"criteria/decoder_labels mismatch: {len(criteria)} vs {len(decoder_labels)}")
         self.optimizer = optimizer
         self.forward_fn = forward_fn
         self.criteria = criteria
@@ -275,117 +288,102 @@ class Trainer:
         self.epochs = epochs
         self.early_stopping_patience = early_stopping_patience
 
-        self._message: Dict[str, str] = {}
-        self._val_loss: float = 0.0
-        self._best_val_loss: float = np.inf
-        self._snooze: int = 0
-        self._epoch: int = 0
-
-    def _validation(
-        self,
-        val_dataset: TensorDataset,
-        kwargs: List[Dict[str, Any]],
-        pbar: tqdm,
-        includes_sample_weights: bool = False
-    ) -> None:
-        if includes_sample_weights:
-            y_val_preds = self.forward_fn(val_dataset[:][:-2], kwargs)
-            val_loss = [
-                criterion(y_val_pred, val_dataset[:][-2], sample_weights=val_dataset[:][-1])
-                for criterion, y_val_pred in zip(self.criteria, y_val_preds)
-            ]
-        else:
-            y_val_preds = self.forward_fn(val_dataset[:][:-1], kwargs)
-            val_loss = [
-                criterion(y_val_pred, val_dataset[:][-1]) for criterion, y_val_pred in zip(self.criteria, y_val_preds)
-            ]
-        val_loss = sum(val_loss)  # TODO: this is not generalizable to model outputs that are not lists!
-        self._val_loss = val_loss.item()
-        self._message.update({'val_loss': f'{self._val_loss:.4f}'})
-        self._epoch += 1
-
-    def _early_stopping(
-        self,
-        val_dataset: TensorDataset,
-        kwargs: List[Dict[str, Any]],
-        pbar: tqdm,
-        includes_sample_weights: bool = False
-    ) -> None:
-        self._validation(val_dataset, kwargs, pbar, includes_sample_weights=includes_sample_weights)
-        if self._val_loss >= self._best_val_loss and self._snooze == self.early_stopping_patience:
-            self._message.update({'val_loss': ' - '.join((self._message['val_loss'], 'Early stopping triggered'))})
-            self._epoch = self.epochs
-        elif self._val_loss >= self._best_val_loss:
-            self._snooze += 1
-        else:
-            self._best_val_loss = self._val_loss
-            self._snooze = 0
-
-    def _default(
-        self, val_dataset: Optional[TensorDataset],
-        kwargs: List[Dict[str, Any]],
-        pbar: tqdm,
-        includes_sample_weights: bool = False
-    ) -> None:
-        self._epoch += 1
+        self._best_val_loss = float("inf")
+        self._stale_epochs = 0
 
     def train(
         self,
         train_dataloader: DataLoader,
-        kwargs: List[Dict[str, Any]],
-        val_dataset: Optional[TensorDataset] = None,
+        kwargs: dict[str, dict[str, Any]],
+        val_dataset: TensorDataset | None = None,
         includes_sample_weights: bool = False,
-    ):
-        """
-        Run training process.
+    ) -> None:
+        """Run the training loop.
 
         Args:
-            train_dataloader (DataLoader): PyTorch dataloader containing training data.
-            kwargs (List[Dict[str, Any]]): Additional arguments to pass to forward functions for each item in
-                dataloader.
-            val_dataset (Optional[TensorDataset], optional): Validation dataset for computing validation loss.
-                Recommended when early stopping criteria is triggered. Defaults to None.
-            includes_sample_weights (bool, optional): Whether the last item in the dataloader represents a tensor
-                dataset for training sample weighting. Defaults to False.
+            train_dataloader: Iterates batched tensors with the same shape contract as ``forward_fn`` expects (plus
+                targets and optional weights at the end).
+            kwargs: Additional keyword args forwarded to ``forward_fn`` per decoder.
+            val_dataset: Optional validation set; required for early stopping.
+            includes_sample_weights: When True, the last tensor in each batch is treated as per-sample weights and the
+                second-to-last as targets.
         """
-        # TODO: val_dataset can be slow for large sets, modify this to use val dataloader
-        if val_dataset is not None:
-            if self.early_stopping_patience > 0:
-                loop_closer = self._early_stopping
-            else:
-                loop_closer = self._validation
-        else:
-            loop_closer = self._default
+        do_validation = val_dataset is not None
+        do_early_stop = do_validation and self.early_stopping_patience > 0
 
         with tqdm(total=self.epochs, desc="Training Progress") as pbar:
-            while self._epoch < self.epochs:
-                for xy in train_dataloader:
-                    # reset gradients
-                    self.optimizer.zero_grad()
+            for _ in range(self.epochs):
+                running_loss, n_batches = 0.0, 0
+                for batch in train_dataloader:
+                    loss = self._step(batch, kwargs, includes_sample_weights)
+                    running_loss += loss
+                    n_batches += 1
 
-                    if includes_sample_weights:
-                        # forward pass
-                        y_preds = self.forward_fn(xy[:-2], kwargs)
+                msg: dict[str, str] = {"loss": f"{running_loss / max(n_batches, 1):.4f}"}
 
-                        # compute loss
-                        loss = [
-                            criterion(y_pred, xy[-2], sample_weights=xy[-1])
-                            for criterion, y_pred in zip(self.criteria, y_preds)
-                        ]
-                    else:
-                        # forward pass
-                        y_preds = self.forward_fn(xy[:-1], kwargs)
+                if do_validation:
+                    val_loss = self._evaluate(val_dataset, kwargs, includes_sample_weights)
+                    msg["val_loss"] = f"{val_loss:.4f}"
+                    if do_early_stop and self._should_stop(val_loss):
+                        msg["val_loss"] += " - early stopping"
+                        pbar.set_postfix(msg)
+                        pbar.update(1)
+                        break
 
-                        # compute loss
-                        loss = [criterion(y_pred, xy[-1]) for criterion, y_pred in zip(self.criteria, y_preds)]
-                    loss = sum(loss)  # TODO: this gives losses equal weight, can try keeping them separate and backpropagate iteratively
-
-                    # backpropagation
-                    loss.backward()
-                    self.optimizer.step()
-
-                # update progress
-                self._message.update({'loss': f'{loss.item():.4f}'})  # TODO: this is only loss from last batch
-                loop_closer(val_dataset, kwargs, pbar, includes_sample_weights=includes_sample_weights)
-                pbar.set_postfix(self._message)
+                pbar.set_postfix(msg)
                 pbar.update(1)
+
+    def _step(
+        self,
+        batch: Tensors,
+        kwargs: dict[str, dict[str, Any]],
+        includes_sample_weights: bool,
+    ) -> float:
+        """One optimizer step on a batch; returns the total scalar loss."""
+        self.optimizer.zero_grad(set_to_none=True)
+        if includes_sample_weights:
+            inputs, target, weights = batch[:-2], batch[-2], batch[-1]
+            preds = self.forward_fn(inputs, kwargs)
+            losses = [
+                criterion(pred, target, sample_weights=weights)
+                for criterion, pred in zip(self.criteria, preds, strict=True)
+            ]
+        else:
+            inputs, target = batch[:-1], batch[-1]
+            preds = self.forward_fn(inputs, kwargs)
+            losses = [criterion(pred, target) for criterion, pred in zip(self.criteria, preds, strict=True)]
+        total = torch.stack(losses).sum()
+        total.backward()
+        self.optimizer.step()
+        return total.item()
+
+    @torch.no_grad()
+    def _evaluate(
+        self,
+        val_dataset: TensorDataset,
+        kwargs: dict[str, dict[str, Any]],
+        includes_sample_weights: bool,
+    ) -> float:
+        """Validation pass over the entire dataset; returns the summed loss."""
+        all_tensors = val_dataset[:]
+        if includes_sample_weights:
+            inputs, target, weights = all_tensors[:-2], all_tensors[-2], all_tensors[-1]
+            preds = self.forward_fn(inputs, kwargs)
+            losses = [
+                criterion(pred, target, sample_weights=weights)
+                for criterion, pred in zip(self.criteria, preds, strict=True)
+            ]
+        else:
+            inputs, target = all_tensors[:-1], all_tensors[-1]
+            preds = self.forward_fn(inputs, kwargs)
+            losses = [criterion(pred, target) for criterion, pred in zip(self.criteria, preds, strict=True)]
+        return torch.stack(losses).sum().item()
+
+    def _should_stop(self, val_loss: float) -> bool:
+        """Track stale validation epochs and return True when patience is exhausted."""
+        if val_loss < self._best_val_loss:
+            self._best_val_loss = val_loss
+            self._stale_epochs = 0
+            return False
+        self._stale_epochs += 1
+        return self._stale_epochs > self.early_stopping_patience
