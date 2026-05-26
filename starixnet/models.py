@@ -295,8 +295,8 @@ class STARIXNet(BaseModel):
             exog_kernel_size: Kernel size for the exogenous Conv1d. Defaults to ``min(50, (lagged_steps + 1) // 2)``.
             ar_encoder: Backbone for the autoregressive decoder; one of ``"conv"`` (Conv1d + AdaptivePool — default,
                 lightweight, fixed receptive field) or ``"transformer"`` (self-attention over the differenced lagged
-                window — heavier per step but able to attend non-uniformly across the window). Exog stays Conv1d in
-                either case; see ``PAPER_NOTES.md`` §Transformer encoder.
+                window — heavier per step but able to attend non-uniformly across the window). The exogenous decoder
+                always uses Conv1d.
             ar_d_model: Token embedding dimension used when ``ar_encoder="transformer"``. Ignored otherwise.
             ar_nhead: Number of attention heads when ``ar_encoder="transformer"``; must divide ``ar_d_model``.
             ar_dim_feedforward: Hidden width of each transformer block's feed-forward sub-layer. Defaults to
