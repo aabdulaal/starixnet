@@ -14,7 +14,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from benchmark.models import LSTM, SARIMA, TFT, DeepAR
+from benchmark.models import LSTM, SARIMA, TFT, DeepAR, DLinear, PatchTST, iTransformer
 
 cur_dir = path.dirname(path.realpath(__file__))
 
@@ -27,6 +27,9 @@ class TestBenchMark:
         self._test_lstm(endog, [exog_1, exog_2])
         self._test_deepar(endog, [exog_1, exog_2])
         self._test_tft(endog, [exog_1, exog_2])
+        self._test_dlinear(endog, [exog_1, exog_2])
+        self._test_patchtst(endog, [exog_1, exog_2])
+        self._test_itransformer(endog, [exog_1, exog_2])
         self._test_sarima(endog)
 
     def _test_lstm(self, endog: pd.DataFrame, exog: list[pd.DataFrame]) -> None:
@@ -77,6 +80,70 @@ class TestBenchMark:
         self.__test_predict(model, endog.iloc[-1440 - 45 : -15], [e.iloc[-1440 - 45 : -15] for e in exog])
         self.__test_save_and_load(model, TFT, "tft")
 
+    def _test_dlinear(self, endog: pd.DataFrame, exog: list[pd.DataFrame]) -> None:
+        model = DLinear(lagged_steps=30, forecast_steps=15, skip_current_step=True, kernel_size=5)
+        assert model._model is None
+        self.__test_fit(
+            model,
+            endog.copy(),
+            exog.copy(),
+            batch_size=256,
+            epochs=3,
+            early_stopping_patience=1,
+            validation_split=0.3,
+            exog_as_unknown_reals=True,
+        )
+        self.__test_predict(model, endog.iloc[-1440 - 45 : -15], [e.iloc[-1440 - 45 : -15] for e in exog])
+        self.__test_save_and_load(model, DLinear, "dlinear")
+
+    def _test_patchtst(self, endog: pd.DataFrame, exog: list[pd.DataFrame]) -> None:
+        model = PatchTST(
+            lagged_steps=30,
+            forecast_steps=15,
+            skip_current_step=True,
+            patch_len=8,
+            stride=4,
+            d_model=16,
+            n_heads=2,
+            n_layers=1,
+        )
+        assert model._model is None
+        self.__test_fit(
+            model,
+            endog.copy(),
+            exog.copy(),
+            batch_size=256,
+            epochs=3,
+            early_stopping_patience=1,
+            validation_split=0.3,
+            exog_as_unknown_reals=True,
+        )
+        self.__test_predict(model, endog.iloc[-1440 - 45 : -15], [e.iloc[-1440 - 45 : -15] for e in exog])
+        self.__test_save_and_load(model, PatchTST, "patchtst")
+
+    def _test_itransformer(self, endog: pd.DataFrame, exog: list[pd.DataFrame]) -> None:
+        model = iTransformer(
+            lagged_steps=30,
+            forecast_steps=15,
+            skip_current_step=True,
+            d_model=16,
+            n_heads=2,
+            n_layers=1,
+        )
+        assert model._model is None
+        self.__test_fit(
+            model,
+            endog.copy(),
+            exog.copy(),
+            batch_size=256,
+            epochs=3,
+            early_stopping_patience=1,
+            validation_split=0.3,
+            exog_as_unknown_reals=True,
+        )
+        self.__test_predict(model, endog.iloc[-1440 - 45 : -15], [e.iloc[-1440 - 45 : -15] for e in exog])
+        self.__test_save_and_load(model, iTransformer, "itransformer")
+
     def _test_sarima(self, endog: pd.DataFrame) -> None:
         model = SARIMA(lagged_steps=30, forecast_steps=15, skip_current_step=True, ar_order=30, differencing=1)
         assert model._model is None
@@ -88,7 +155,7 @@ class TestBenchMark:
 
     def __test_fit(
         self,
-        model: LSTM | DeepAR | SARIMA | TFT,
+        model: LSTM | DeepAR | SARIMA | TFT | DLinear | PatchTST | iTransformer,
         endog: pd.DataFrame,
         exog: list[pd.DataFrame] | None = None,
         **kwargs: Any,
@@ -110,7 +177,7 @@ class TestBenchMark:
 
     def __test_predict(
         self,
-        model: LSTM | DeepAR | SARIMA | TFT,
+        model: LSTM | DeepAR | SARIMA | TFT | DLinear | PatchTST | iTransformer,
         endog: pd.DataFrame,
         exog: list[pd.DataFrame] | None = None,
     ) -> None:
@@ -127,7 +194,7 @@ class TestBenchMark:
 
     def __test_save_and_load(
         self,
-        model: LSTM | DeepAR | SARIMA | TFT,
+        model: LSTM | DeepAR | SARIMA | TFT | DLinear | PatchTST | iTransformer,
         cls: type,
         filename: str,
     ) -> None:
