@@ -39,13 +39,24 @@ class TestSTARIXNet:
         model = self._init_model(applied_attributes=["temporal", "autoregressive"])
         self.__test_fit(model, endog, exog_1, loss_q=(0.5, 0.95), sample_weights=False)
         self.__test_predict(model, endog.iloc[-1440 - 45 : -15], exog_1.iloc[-1440 - 45 : -15])
-        self.__test_save(model)
-        self.__test_load_model()
+        self.__test_save(model, "starixnet.z")
+        self.__test_load_model("starixnet.z")
+
+        # ar_encoder="transformer" — exercise both multivariate and univariate forward paths plus a save/load round-trip
+        model = self._init_model(ar_encoder="transformer")
+        self.__test_fit(model, endog, exog_1, loss_q=0.5, sample_weights=False)
+        self.__test_predict(model, endog.iloc[-1440 - 45 : -15], exog_1.iloc[-1440 - 45 : -15])
+        model = self._init_model(fit_multivariate=False, ar_encoder="transformer")
+        self.__test_fit(model, endog, exog_1, loss_q=0.5, sample_weights=False)
+        self.__test_predict(model, endog.iloc[-1440 - 45 : -15], exog_1.iloc[-1440 - 45 : -15])
+        self.__test_save(model, "starixnet_transformer.z")
+        self.__test_load_model("starixnet_transformer.z")
 
     def _init_model(
         self,
         fit_multivariate: bool = True,
         applied_attributes: list[str] | None = None,
+        ar_encoder: str = "conv",
     ) -> STARIXNet:
         return STARIXNet(
             10080,
@@ -58,6 +69,7 @@ class TestSTARIXNet:
             skip_current_step=True,
             fit_multivariate=fit_multivariate,
             applied_attributes=applied_attributes,
+            ar_encoder=ar_encoder,
         )
 
     def __test_fit(
@@ -117,16 +129,16 @@ class TestSTARIXNet:
         assert aggregated.max() < np.inf
         assert aggregated.shape == (1440, model.forecast_steps, model._endog_size)
 
-    def __test_save(self, model: STARIXNet) -> None:
+    def __test_save(self, model: STARIXNet, filename: str) -> None:
         models_dir = path.join(cur_dir, "models")
         if not path.exists(models_dir):
             makedirs(models_dir)
-        filepath = path.join(models_dir, "starixnet.z")
+        filepath = path.join(models_dir, filename)
         model.save(filepath)
         assert path.exists(filepath)
 
-    def __test_load_model(self) -> None:
-        model = STARIXNet.load_model(path.join(cur_dir, "models", "starixnet.z"))
+    def __test_load_model(self, filename: str) -> None:
+        model = STARIXNet.load_model(path.join(cur_dir, "models", filename))
         assert model._forward_logic
         active = set(model._forward_logic)
         if "seasonal" in active:
