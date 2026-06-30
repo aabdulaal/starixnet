@@ -129,6 +129,28 @@ Tensor convention throughout: `(samples, steps, features)`.
 
 The benchmark models in `benchmark/models.py` follow the same `fit(endog, exog, …) / predict(endog, exog)` API and are implemented directly in PyTorch + Lightning (no `pytorch-forecasting` dependency).
 
+## How to cite
+
+If you use this work in any way, please cite the accompanying paper:
+
+### STARIXNet (arXiv preprint):
+
+    Abdulaal, A., Aytekin, M., Srinivasan, T. K., Lancewicki, T. (2026).
+    STARIXNet: Multivariate and Multi-attribute Deep Learning Approach to Real-Time Resource Allocation in Cloud Platforms.
+    arXiv preprint arXiv:2606.07565.
+click [here](https://arxiv.org/abs/2606.07565) to access the above publication.
+
+BibTeX:
+
+```bibtex
+@article{abdulaal2026starixnet,
+  title={STARIXNet: Multivariate and Multi-attribute Deep Learning Approach to Real-Time Resource Allocation in Cloud Platforms},
+  author={Abdulaal, Ahmed and Aytekin, Maruf and Srinivasan, Thilaga Kumaran and Lancewicki, Tomer},
+  journal={arXiv preprint arXiv:2606.07565},
+  year={2026}
+}
+```
+
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE).
