@@ -8,6 +8,7 @@ tree.
 
 from __future__ import annotations
 
+import math
 from io import BytesIO
 from typing import Any, Self
 from zipfile import ZIP_DEFLATED, ZipFile
@@ -23,7 +24,7 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from starixnet.models import BaseModel, ExogFrames, _is_multi_exog
-from starixnet.utilities import make_seq2seq_windows
+from starixnet.utilities import extract_frequencies, make_seq2seq_windows
 
 # -------------------------------------------------------------------------------------------------------------------- #
 # Shared encoder/decoder sequence preparation                                                                          #
@@ -31,7 +32,7 @@ from starixnet.utilities import make_seq2seq_windows
 
 
 class LightningBaseModel(BaseModel):
-    """Base for the deep-learning benchmarks (LSTM, DeepAR, TFT, DLinear, PatchTST, iTransformer).
+    """Base for the deep-learning benchmarks (LSTM, DeepAR, TFT, CrossLinear, TimeXer, iTransformer).
 
     Provides sequence preparation, Lightning training orchestration, and save/load via a zip archive (joblib config +
     ``state_dict``). All subclasses share the same ``fit`` / ``predict`` / ``save`` / ``load_model`` signature so they
@@ -112,34 +113,21 @@ class LightningBaseModel(BaseModel):
         endog: pd.DataFrame,
         exog: pd.DataFrame | None,
     ) -> np.ndarray:
-        """Sliding-window encoder array for prediction (no decoder targets)."""
-        encoder_only = make_seq2seq_windows(
-            endog,
-            lagged_steps=self.lagged_steps,
-            forecast_steps=0,
-            lagged_features=endog.columns.to_list(),
-            return_x_only=True,
-        )
-        encoder = encoder_only.to_numpy(dtype=np.float32).reshape(
-            -1,
-            self.lagged_steps,
-            self._endog_size,
-        )
+        """Sliding-window encoder array for prediction (no decoder targets).
+
+        Returns ``(N - lagged_steps + 1, lagged_steps, channels)``: window ``i`` covers rows ``[i, i + lagged_steps)``
+        so the last window ends at the newest observation. This is the pre-refactor ``pytorch-forecasting`` inference
+        contract; ``make_seq2seq_windows(return_x_only=True)`` must not be used here because its windows stop one row
+        short of their anchor, which silently drops the newest observation and shifts every forecast one step early.
+        """
+        if endog.shape[0] < self.lagged_steps:
+            raise ValueError(f"predict needs at least lagged_steps={self.lagged_steps} rows, got {endog.shape[0]}")
+        frame = endog
         if self._exog_as_unknown_reals and exog is not None:
-            exog_only = make_seq2seq_windows(
-                exog,
-                lagged_steps=self.lagged_steps,
-                forecast_steps=0,
-                lagged_features=exog.columns.to_list(),
-                return_x_only=True,
-            )
-            exog_arr = exog_only.to_numpy(dtype=np.float32).reshape(
-                -1,
-                self.lagged_steps,
-                exog.shape[1],
-            )
-            encoder = np.concatenate([encoder, exog_arr], axis=-1)
-        return encoder
+            frame = pd.concat([endog, exog], axis=1)
+        values = frame.to_numpy(dtype=np.float32)
+        windows = np.lib.stride_tricks.sliding_window_view(values, self.lagged_steps, axis=0)
+        return np.ascontiguousarray(windows.transpose(0, 2, 1))
 
     # ----------------------------------------------------------------------------------------------------------- public
 
@@ -437,6 +425,19 @@ class _DeepARNet(pl.LightningModule):
             dropout=dropout if rnn_layers > 1 else 0.0,
             batch_first=True,
         )
+        # Exog is only observed in the past, so the rollout cannot consume it; a separate endog-only decoder takes
+        # over the encoder state. Without exog the encoder LSTM doubles as decoder (keeps the state_dict unchanged).
+        self.decoder_lstm = (
+            nn.LSTM(
+                input_size=endog_size,
+                hidden_size=hidden_size,
+                num_layers=rnn_layers,
+                dropout=dropout if rnn_layers > 1 else 0.0,
+                batch_first=True,
+            )
+            if input_size > endog_size
+            else None
+        )
         # outputs (mu, log_sigma) per target
         self.mu_head = nn.Linear(hidden_size, endog_size)
         self.log_sigma_head = nn.Linear(hidden_size, endog_size)
@@ -453,22 +454,20 @@ class _DeepARNet(pl.LightningModule):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Autoregressively roll out ``future_steps`` predictions.
 
-        Returns ``(mu, sigma)`` each shaped ``(B, future_steps, endog_size)``. The last observed step's exogenous
-        channels (if any) are carried forward unchanged at every rollout step.
+        Returns ``(mu, sigma)`` each shaped ``(B, future_steps, endog_size)``. Exogenous channels (if any) are only
+        read by the encoder; the rollout is fed endogenous values alone.
         """
         _, state = self.lstm(encoder)
-        last_step = encoder[:, -1:, :]  # (B, 1, input_size)
-        has_exog = last_step.shape[-1] > self.endog_size
-        exog_tail = last_step[:, :, self.endog_size :] if has_exog else None
+        decoder = self.decoder_lstm if self.decoder_lstm is not None else self.lstm
+        last_step = encoder[:, -1:, : self.endog_size]
 
         mus, sigmas = [], []
         for _ in range(future_steps):
-            h, state = self.lstm(last_step, state)
+            h, state = decoder(last_step, state)
             dist = self._step_distribution(h[:, -1, :])
             mus.append(dist.mean.unsqueeze(1))
             sigmas.append(dist.stddev.unsqueeze(1))
-            next_endog = dist.mean.unsqueeze(1)
-            last_step = torch.cat([next_endog, exog_tail], dim=-1) if has_exog else next_endog
+            last_step = dist.mean.unsqueeze(1)
         return torch.cat(mus, dim=1), torch.cat(sigmas, dim=1)
 
     def training_step(self, batch: tuple[torch.Tensor, torch.Tensor], _: int) -> torch.Tensor:
@@ -703,40 +702,23 @@ class TFT(LightningBaseModel):
 
 
 # -------------------------------------------------------------------------------------------------------------------- #
-# DLinear                                                                                                              #
+# CrossLinear                                                                                                          #
 # -------------------------------------------------------------------------------------------------------------------- #
 
 
-class _SeriesDecomp(nn.Module):
-    """Trend / seasonal split via a centred moving average (Zeng et al., 2022).
+class _CrossLinearNet(pl.LightningModule):
+    """CrossLinear (Zhou et al., KDD 2025), following the authors' reference implementation.
 
-    Pads the input with the boundary values so the trend output matches the input length. The seasonal component is the
-    residual.
+    Every channel is instance-normalised over the lookback window. A kernel-3 Conv1d over all channels ([endog | exog])
+    produces one cross-correlation series per target, blended with the target's own normalised series through a
+    learnable ``alpha``. The blend is split into non-overlapping patches, embedded by an MLP, mixed with a positional
+    embedding through a learnable ``beta``, and decoded by an MLP head over the flattened patches; the output is
+    de-normalised with the targets' window statistics. The reference ``MS`` mode (one target) is generalised to
+    ``endog_size`` targets by widening the Conv1d output, as described in the paper's multivariate extension. Without
+    exog the Conv1d mixes the targets only, matching the reference ``M`` mode.
     """
 
-    def __init__(self, kernel_size: int) -> None:
-        super().__init__()
-        self.kernel_size = kernel_size
-        self.avg = nn.AvgPool1d(kernel_size=kernel_size, stride=1, padding=0)
-
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        # x: (B, T, C). AvgPool1d expects (B, C, T), so we permute around the pool call.
-        pad_left = (self.kernel_size - 1) // 2
-        pad_right = self.kernel_size - 1 - pad_left
-        front = x[:, 0:1, :].repeat(1, pad_left, 1)
-        end = x[:, -1:, :].repeat(1, pad_right, 1)
-        padded = torch.cat([front, x, end], dim=1).permute(0, 2, 1)
-        trend = self.avg(padded).permute(0, 2, 1)
-        seasonal = x - trend
-        return seasonal, trend
-
-
-class _DLinearNet(pl.LightningModule):
-    """Decomposition-Linear forecaster (Zeng et al., 2022).
-
-    Splits the encoder window into trend + seasonal via moving-average decomposition and applies a dedicated linear
-    projection over the time dimension to each component. Channel-independent in the ``individual=True`` mode.
-    """
+    _EPS = 1e-5
 
     def __init__(
         self,
@@ -744,48 +726,55 @@ class _DLinearNet(pl.LightningModule):
         endog_size: int,
         lagged_steps: int,
         prediction_length: int,
-        kernel_size: int,
-        individual: bool,
+        patch_len: int,
+        d_model: int,
+        d_ff: int,
+        alpha: float,
+        beta: float,
     ) -> None:
         super().__init__()
         self.input_size = input_size
         self.endog_size = endog_size
         self.lagged_steps = lagged_steps
         self.prediction_length = prediction_length
-        self.individual = individual
-        self.decomp = _SeriesDecomp(kernel_size)
+        self.patch_len = max(1, min(patch_len, lagged_steps))
+        self.n_patches = math.ceil(lagged_steps / self.patch_len)
+        self.pad_size = self.n_patches * self.patch_len - lagged_steps
 
-        if individual:
-            self.linear_seasonal = nn.ModuleList(
-                [nn.Linear(lagged_steps, prediction_length) for _ in range(input_size)]
-            )
-            self.linear_trend = nn.ModuleList([nn.Linear(lagged_steps, prediction_length) for _ in range(input_size)])
-        else:
-            self.linear_seasonal = nn.Linear(lagged_steps, prediction_length)
-            self.linear_trend = nn.Linear(lagged_steps, prediction_length)
+        self.alpha = nn.Parameter(torch.ones(1) * alpha)
+        self.beta = nn.Parameter(torch.ones(1) * beta)
+        self.correlation_embedding = nn.Conv1d(input_size, endog_size, 3, padding="same")
+        self.value_embedding = nn.Sequential(
+            nn.LayerNorm([endog_size, self.n_patches, self.patch_len]),
+            nn.Linear(self.patch_len, d_ff),
+            nn.LayerNorm([endog_size, self.n_patches, d_ff]),
+            nn.ReLU(),
+            nn.Linear(d_ff, d_model),
+            nn.LayerNorm([endog_size, self.n_patches, d_model]),
+            nn.ReLU(),
+        )
+        self.pos_embedding = nn.Parameter(torch.randn(1, endog_size, self.n_patches, d_model))
+        self.head = nn.Sequential(
+            nn.Flatten(2),
+            nn.Linear(self.n_patches * d_model, d_ff),
+            nn.LayerNorm([endog_size, d_ff]),
+            nn.ReLU(),
+            nn.Linear(d_ff, prediction_length),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, T, C)
-        seasonal, trend = self.decomp(x)
-        seasonal = seasonal.permute(0, 2, 1)  # (B, C, T)
-        trend = trend.permute(0, 2, 1)
+        # x: (B, T, C) with layout [endog | exog] → (B, C, T)
+        x = x.permute(0, 2, 1)
+        target = x[:, : self.endog_size, :]
+        mean = target.mean(dim=-1, keepdim=True)
+        std = target.std(dim=-1, keepdim=True)
+        x = (x - x.mean(dim=-1, keepdim=True)) / (x.std(dim=-1, keepdim=True) + self._EPS)
 
-        if self.individual:
-            seasonal_out = torch.stack(
-                [self.linear_seasonal[i](seasonal[:, i, :]) for i in range(self.input_size)],
-                dim=1,
-            )
-            trend_out = torch.stack(
-                [self.linear_trend[i](trend[:, i, :]) for i in range(self.input_size)],
-                dim=1,
-            )
-        else:
-            seasonal_out = self.linear_seasonal(seasonal)
-            trend_out = self.linear_trend(trend)
-
-        out = (seasonal_out + trend_out).permute(0, 2, 1)  # (B, prediction_length, C)
-        # Encoder layout is [endog | exog]; keep only the endog channels in the forecast.
-        return out[:, :, : self.endog_size]
+        h = self.alpha * x[:, : self.endog_size, :] + (1 - self.alpha) * self.correlation_embedding(x)
+        h = nn.functional.pad(h, (0, self.pad_size)).unfold(2, self.patch_len, self.patch_len)
+        h = self.beta * self.value_embedding(h) + (1 - self.beta) * self.pos_embedding
+        out = self.head(h) * std + mean  # (B, E, prediction_length)
+        return out.permute(0, 2, 1)
 
     def training_step(self, batch: tuple[torch.Tensor, torch.Tensor], _: int) -> torch.Tensor:
         x, y = batch
@@ -806,40 +795,52 @@ class _DLinearNet(pl.LightningModule):
         return self(x)
 
 
-class DLinear(LightningBaseModel):
-    """Decomposition-Linear baseline (Zeng et al., 2022).
+class CrossLinear(LightningBaseModel):
+    """CrossLinear baseline (Zhou et al., KDD 2025) — linear-family forecaster built for exogenous variables.
 
-    A minimal-parameter forecaster that splits the encoder window into trend + seasonal via moving average and applies
-    independent linear projections over the time dimension. Serves as the architectural sanity check for whether more
-    complex models in the benchmark are justified.
+    Patch-wise MLP backbone with a lightweight cross-correlation embedding that injects time-invariant dependencies on
+    the exogenous signals. Replaces DLinear in the benchmark suite: it keeps the "is STARIXNet's complexity justified?"
+    role of the linear family while also consuming the exogenous signals. Defaults follow the authors' ECL scripts.
     """
 
     def __init__(
         self,
-        kernel_size: int = 25,
-        individual: bool = False,
+        patch_len: int = 2,
+        d_model: int = 256,
+        d_ff: int = 1024,
+        alpha: float = 1.0,
+        beta: float = 1.0,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
-        self.kernel_size = kernel_size
-        self.individual = individual
+        self.patch_len = patch_len
+        self.d_model = d_model
+        self.d_ff = d_ff
+        self.alpha = alpha
+        self.beta = beta
 
     def _build(self) -> None:
-        self._model = _DLinearNet(
+        self._model = _CrossLinearNet(
             input_size=self._total_input_size,
             endog_size=self._endog_size,
             lagged_steps=self.lagged_steps,
             prediction_length=self._prediction_length,
-            kernel_size=self.kernel_size,
-            individual=self.individual,
+            patch_len=self.patch_len,
+            d_model=self.d_model,
+            d_ff=self.d_ff,
+            alpha=self.alpha,
+            beta=self.beta,
         )
 
     def get_config(self) -> dict[str, Any]:
         config = super().get_config()
         config.update(
             {
-                "kernel_size": self.kernel_size,
-                "individual": self.individual,
+                "patch_len": self.patch_len,
+                "d_model": self.d_model,
+                "d_ff": self.d_ff,
+                "alpha": self.alpha,
+                "beta": self.beta,
             }
         )
         return config
@@ -853,16 +854,49 @@ class DLinear(LightningBaseModel):
 
 
 # -------------------------------------------------------------------------------------------------------------------- #
-# PatchTST                                                                                                             #
+# TimeXer                                                                                                              #
 # -------------------------------------------------------------------------------------------------------------------- #
 
 
-class _PatchTSTNet(pl.LightningModule):
-    """Channel-independent patch transformer (Nie et al., 2023).
+class _TimeXerBlock(nn.Module):
+    """One TimeXer layer: patch-wise self-attention over the endogenous tokens, then cross-attention from the global
+    token to the exogenous variate tokens, then a feed-forward pass (post-norm residuals throughout).
+    """
 
-    Each channel's lagged window is split into overlapping patches and passed through a shared transformer encoder. The
-    head projects the flattened patch embeddings to the forecast horizon. Channel-independence means cross-variate
-    dependencies are not modelled here — that role is reserved for iTransformer in the benchmark suite.
+    def __init__(self, d_model: int, n_heads: int, dropout: float) -> None:
+        super().__init__()
+        self.self_attention = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        self.cross_attention = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        self.feed_forward = nn.Sequential(
+            nn.Linear(d_model, d_model * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 4, d_model),
+        )
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, h: torch.Tensor, variates: torch.Tensor) -> torch.Tensor:
+        # h: (B*E, n_patches + 1, d_model) with the global token last; variates: (B*E, V, d_model)
+        attn, _ = self.self_attention(h, h, h, need_weights=False)
+        h = self.norm1(h + self.dropout(attn))
+        glb = h[:, -1:, :]
+        cross, _ = self.cross_attention(glb, variates, variates, need_weights=False)
+        glb = self.norm2(glb + self.dropout(cross))
+        h = torch.cat([h[:, :-1, :], glb], dim=1)
+        return self.norm3(h + self.dropout(self.feed_forward(h)))
+
+
+class _TimeXerNet(pl.LightningModule):
+    """TimeXer (Wang et al., 2024): patch transformer on the targets with cross-attention to exogenous variates.
+
+    Each endogenous series is split into non-overlapping patches plus one learnable global token, and processed with
+    shared weights (channel-independent across targets, as in PatchTST). Each exogenous series is embedded whole as a
+    single variate token (as in iTransformer) and reaches the target only through the global token's cross-attention.
+    Without exog, the targets' own variate tokens are used as the cross-attention context, mirroring the reference
+    implementation's multivariate mode.
     """
 
     def __init__(
@@ -872,7 +906,6 @@ class _PatchTSTNet(pl.LightningModule):
         lagged_steps: int,
         prediction_length: int,
         patch_len: int,
-        stride: int,
         d_model: int,
         n_heads: int,
         n_layers: int,
@@ -884,13 +917,9 @@ class _PatchTSTNet(pl.LightningModule):
         self.lagged_steps = lagged_steps
         self.prediction_length = prediction_length
         self.patch_len = max(1, min(patch_len, lagged_steps))
-        self.stride = max(1, min(stride, self.patch_len))
-
-        # Replicate-pad the tail so (lagged_steps - patch_len) is divisible by stride and the patch count is integer.
-        excess = (lagged_steps - self.patch_len) % self.stride
-        self.pad_size = (self.stride - excess) if excess > 0 else 0
-        padded_len = lagged_steps + self.pad_size
-        self.n_patches = (padded_len - self.patch_len) // self.stride + 1
+        # Replicate-pad the tail so lagged_steps is a whole number of patches.
+        self.pad_size = -lagged_steps % self.patch_len
+        self.n_patches = (lagged_steps + self.pad_size) // self.patch_len
 
         # d_model must be divisible by n_heads for nn.MultiheadAttention.
         head_dim = max(1, d_model // n_heads)
@@ -898,37 +927,32 @@ class _PatchTSTNet(pl.LightningModule):
 
         self.patch_embed = nn.Linear(self.patch_len, self.d_model)
         self.pos_embed = nn.Parameter(torch.zeros(1, self.n_patches, self.d_model))
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=self.d_model,
-            nhead=n_heads,
-            dim_feedforward=self.d_model * 4,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-        self.head = nn.Linear(self.n_patches * self.d_model, prediction_length)
+        self.global_token = nn.Parameter(torch.randn(1, endog_size, 1, self.d_model))
+        self.variate_embed = nn.Linear(lagged_steps, self.d_model)
+        self.layers = nn.ModuleList(_TimeXerBlock(self.d_model, n_heads, dropout) for _ in range(n_layers))
+        self.norm = nn.LayerNorm(self.d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.head = nn.Linear((self.n_patches + 1) * self.d_model, prediction_length)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, T, C) → (B, C, T) for time-axis patching.
-        b, _, c = x.shape
-        x = x.permute(0, 2, 1)
+        # x: (B, T, C) with layout [endog | exog]
+        b = x.shape[0]
+        endog = x[:, :, : self.endog_size].permute(0, 2, 1)  # (B, E, T)
         if self.pad_size > 0:
-            tail = x[:, :, -1:].repeat(1, 1, self.pad_size)
-            x = torch.cat([x, tail], dim=-1)
-        # Unfold the time dim into overlapping patches: (B, C, n_patches, patch_len).
-        patches = x.unfold(dimension=-1, size=self.patch_len, step=self.stride)
-        # Channel-independent: collapse (B, C) into one batch dim so all channels share the same transformer.
-        patches = patches.reshape(b * c, self.n_patches, self.patch_len)
+            endog = torch.cat([endog, endog[:, :, -1:].repeat(1, 1, self.pad_size)], dim=-1)
+        patches = endog.unfold(dimension=-1, size=self.patch_len, step=self.patch_len)  # (B, E, n_patches, patch_len)
+        tokens = self.patch_embed(patches) + self.pos_embed
+        glb = self.global_token.expand(b, -1, -1, -1)
+        h = torch.cat([tokens, glb], dim=2).reshape(b * self.endog_size, self.n_patches + 1, self.d_model)
 
-        h = self.patch_embed(patches) + self.pos_embed
-        h = self.encoder(h)
-        h = h.flatten(start_dim=1)  # (B*C, n_patches * d_model)
-        out = self.head(h)  # (B*C, prediction_length)
-        out = out.reshape(b, c, self.prediction_length).permute(0, 2, 1)  # (B, prediction_length, C)
-        # Encoder layout is [endog | exog]; keep only the endog channels in the forecast.
-        return out[:, :, : self.endog_size]
+        context = x[:, :, self.endog_size :] if x.shape[-1] > self.endog_size else x[:, :, : self.endog_size]
+        variates = self.variate_embed(context.permute(0, 2, 1))  # (B, V, d_model)
+        variates = variates.repeat_interleave(self.endog_size, dim=0)  # (B*E, V, d_model)
+
+        for layer in self.layers:
+            h = layer(h, variates)
+        out = self.head(self.dropout(self.norm(h).flatten(start_dim=1)))  # (B*E, prediction_length)
+        return out.view(b, self.endog_size, self.prediction_length).permute(0, 2, 1)
 
     def training_step(self, batch: tuple[torch.Tensor, torch.Tensor], _: int) -> torch.Tensor:
         x, y = batch
@@ -949,40 +973,37 @@ class _PatchTSTNet(pl.LightningModule):
         return self(x)
 
 
-class PatchTST(LightningBaseModel):
-    """Channel-independent patch-based transformer (Nie et al., 2023).
+class TimeXer(LightningBaseModel):
+    """TimeXer baseline (Wang et al., 2024) — the exogenous-aware successor of PatchTST.
 
-    Splits each channel's lagged window into overlapping patches, processes them with a shared transformer encoder,
-    and projects the flattened patch embeddings to the forecast horizon. Channel-independence makes the model robust
-    to distribution shift in unrelated channels at the cost of ignoring cross-variate dependencies.
+    Keeps PatchTST's patch-level temporal attention on the targets and adds variate-level cross-attention to the
+    exogenous signals through a learnable global token. Replaces PatchTST in the benchmark suite, whose channel-
+    independent design cannot consume exog at all.
     """
 
     def __init__(
         self,
         patch_len: int = 16,
-        stride: int = 8,
         d_model: int = 128,
         n_heads: int = 4,
-        n_layers: int = 3,
+        n_layers: int = 2,
         dropout: float = 0.0,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self.patch_len = patch_len
-        self.stride = stride
         self.d_model = d_model
         self.n_heads = n_heads
         self.n_layers = n_layers
         self.dropout = dropout
 
     def _build(self) -> None:
-        self._model = _PatchTSTNet(
+        self._model = _TimeXerNet(
             input_size=self._total_input_size,
             endog_size=self._endog_size,
             lagged_steps=self.lagged_steps,
             prediction_length=self._prediction_length,
             patch_len=self.patch_len,
-            stride=self.stride,
             d_model=self.d_model,
             n_heads=self.n_heads,
             n_layers=self.n_layers,
@@ -994,7 +1015,6 @@ class PatchTST(LightningBaseModel):
         config.update(
             {
                 "patch_len": self.patch_len,
-                "stride": self.stride,
                 "d_model": self.d_model,
                 "n_heads": self.n_heads,
                 "n_layers": self.n_layers,
@@ -1342,3 +1362,107 @@ class SARIMA(BaseModel):
 
     def _forecast(self, res: SARIMAXResults) -> np.ndarray:
         return res.forecast(self._prediction_length)[-self.forecast_steps :].reshape(1, -1, 1)
+
+
+# -------------------------------------------------------------------------------------------------------------------- #
+# Seasonal Naive                                                                                                       #
+# -------------------------------------------------------------------------------------------------------------------- #
+
+
+class SeasonalNaive(BaseModel):
+    """Seasonal naive forecaster: every future step repeats the value observed one season earlier.
+
+    Training-free sanity baseline (conventionally not counted against the benchmark cap). It answers whether STARIXNet's
+    seasonal branch beats simply replaying the last period. The season length is ``max(enforced_periods)`` when given
+    (the same period ``BaseModel`` uses for quality checks), else the dominant PSD period found by
+    :func:`~starixnet.utilities.extract_frequencies` with STARIXNet's peak-detection defaults. Exogenous variables are
+    accepted and silently dropped.
+
+    Like :class:`SARIMA` the model is stateful: it keeps the last season of observations and extends it with every
+    ``predict`` input, so callers can keep sending ``lagged_steps``-long windows even when the season is much longer.
+    ``predict`` follows the deep benchmarks' contract of one forecast per full ``lagged_steps`` window, the last of
+    which ends at the newest observation. Gaps between stored history and new input are forward-filled.
+    """
+
+    def __init__(self, min_peak_distance: int = 60, min_oscillations: int = 3, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.min_peak_distance = min_peak_distance
+        self.min_oscillations = min_oscillations
+        self._season_length: int = 0
+        self._step_size: int = 0
+        self._history: pd.DataFrame | None = None
+
+    # ----------------------------------------------------------------------------------------------------------- public
+
+    def fit(self, endog: pd.DataFrame, exog: ExogFrames | None = None, **kwargs: Any) -> Self:
+        endog, _ = super().fit(endog, exog=None, **kwargs)
+        self._step_size = int(endog.index[1] - endog.index[0])
+        self._season_length = self._resolve_season_length(endog)
+        if endog.shape[0] < self._season_length:
+            raise ValueError(f"fit needs at least one season ({self._season_length} rows), got {endog.shape[0]}")
+        self._history = endog[self._endog_labels].iloc[-self._season_length :].copy()
+        return self
+
+    def predict(self, endog: pd.DataFrame, exog: ExogFrames | None = None) -> np.ndarray:
+        missing = [f for f in self._endog_labels if f not in endog.columns]
+        if missing:
+            raise ValueError(f"endog is missing required columns: {missing}")
+        if endog.shape[0] < self.lagged_steps:
+            raise ValueError(f"predict needs at least lagged_steps={self.lagged_steps} rows, got {endog.shape[0]}")
+        endog = endog[self._endog_labels]
+
+        combined = pd.concat([self._history, endog])
+        combined = combined[~combined.index.duplicated(keep="last")].sort_index()
+        grid = range(int(combined.index[0]), int(combined.index[-1]) + 1, self._step_size)
+        combined = combined.reindex(grid).ffill()
+        values = combined.to_numpy(dtype=np.float64)
+
+        # anchor of each window (its newest observation) as a position in the regular grid
+        anchors = combined.index.get_indexer(endog.index[self.lagged_steps - 1 :])
+        offsets = np.arange(1, self.forecast_steps + 1) + int(self.skip_current_step)
+        sources = anchors[:, None] + offsets[None, :] - self._season_length * np.ceil(offsets / self._season_length)
+        sources = sources.astype(int)
+        if sources.min() < 0:
+            raise ValueError(
+                f"not enough history: the earliest window needs {-sources.min()} more row(s) before it to look back "
+                f"one season ({self._season_length} steps); send a longer input or call predict in time order"
+            )
+
+        self._history = combined.iloc[-self._season_length :]
+        return np.clip(values[sources], 0.0, np.inf)
+
+    def get_config(self) -> dict[str, Any]:
+        config = super().get_config()
+        config.update(
+            {
+                "min_peak_distance": self.min_peak_distance,
+                "min_oscillations": self.min_oscillations,
+                "_season_length": self._season_length,
+                "_step_size": self._step_size,
+                "_history": self._history,
+            }
+        )
+        return config
+
+    @classmethod
+    def load_model(cls, filepath: str | BytesIO) -> Self:
+        instance = cls(0)
+        config = load(filepath)
+        for param, val in config.items():
+            setattr(instance, param, val)
+        return instance
+
+    # ---------------------------------------------------------------------------------------------------------- private
+
+    def _resolve_season_length(self, endog: pd.DataFrame) -> int:
+        if self.enforced_periods:
+            return int(max(self.enforced_periods))
+        freqs = extract_frequencies(
+            endog,
+            distance=self.min_peak_distance,
+            min_periods=self.min_oscillations,
+            max_freqs=1,
+        )
+        if not freqs:
+            raise ValueError("no seasonal period detected via PSD; pass enforced_periods to set the season length")
+        return round(2.0 * np.pi / freqs[0])
