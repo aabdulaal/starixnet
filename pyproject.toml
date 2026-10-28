@@ -2,7 +2,7 @@
 name = "starixnet"
 version = "0.1.0"
 description = "Deep learning model for multivariate and multi-attribute time-series forecasting."
-authors = [{ name = "Ahmed Abdulaal", email = "ahmed.abdulaal@walmart.com" }]
+authors = [{ name = "Ahmed Abdulaal", email = "AhmedR.Abdulaal@gmail.com" }]
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.11,<3.14"

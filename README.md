@@ -232,4 +232,4 @@ uv run pip-licenses --format=json > licenses/third-party-licenses.json
 
 ## Maintainer
 
-Ahmed Abdulaal <ahmed.abdulaal@walmart.com>
+Ahmed Abdulaal <AhmedR.Abdulaal@gmail.com>
