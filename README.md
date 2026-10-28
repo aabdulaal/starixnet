@@ -2,6 +2,8 @@
 
 Encoder–decoder neural network for multivariate, multi-attribute time-series forecasting. The model decomposes a forecast into independent decoder branches — **S**easonal, **T**emporal, **A**uto**R**egressive **I**ntegrated, and e**X**ogenous — then aggregates them via a quantile reduction at prediction time. Six benchmark challengers (SARIMA, DeepAR, TFT, CrossLinear, TimeXer, iTransformer) are included; see [Benchmarks](#benchmarks).
 
+> **Citing STARIXNet:** if you use this work, please cite the [accompanying paper](#how-to-cite) (arXiv:2606.07565).
+
 ## Repository layout
 
 ```
@@ -165,6 +167,9 @@ forecast = model.predict(endog.tail(30), exog=[e.tail(30) for e in (exog_1, exog
 
 ### References
 
+<details>
+<summary>Original papers and recent cloud-workload uses of each benchmark (click to expand)</summary>
+
 Original papers, followed by recent uses of the model in cloud-resource / workload forecasting where we could find them. For CrossLinear and TimeXer we found no cloud-workload application yet, so recent general benchmark usage is listed instead.
 
 - **SARIMA**
@@ -188,6 +193,8 @@ Original papers, followed by recent uses of the model in cloud-resource / worklo
   - Liu, Y., Hu, T., Zhang, H., et al. iTransformer: Inverted Transformers Are Effective for Time Series Forecasting. *ICLR 2024*. [link](https://arxiv.org/abs/2310.06625)
   - Chen, J., Ye, H., Jiang, F., et al. Fremer: Lightweight and Effective Frequency Transformer for Workload Forecasting in Cloud Services. arXiv:2507.12908, 2025 (iTransformer baseline on ByteDance cloud-service workloads). [link](https://arxiv.org/abs/2507.12908)
   - Cloud Resource Workload Forecasting Method Based on the MST-iTransformer Model. *Future Internet*, 18(9), 2026 (iTransformer variant on the Alibaba cluster trace). [link](https://www.mdpi.com/1999-5903/18/9/448)
+
+</details>
 
 ## How to cite
 
