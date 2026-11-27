@@ -13,6 +13,7 @@ from os import makedirs, path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from starixnet.models import STARIXNet
 
@@ -145,3 +146,50 @@ class TestSTARIXNet:
             assert model._params
         if active & {"temporal", "autoregressive", "exogenous"}:
             assert model._moduls
+
+
+def _parity_series(start: str, periods: int, unit: str = "ns") -> pd.DataFrame:
+    index = pd.date_range(start, periods=periods, freq="min", tz="UTC").as_unit(unit)
+    minutes = index.as_unit("s").asi8 // 60
+    return pd.DataFrame({"cpu_used": np.where(minutes % 2 == 0, 10.0, 20.0)}, index=index)
+
+
+def _parity_model(attribute: str = "temporal") -> STARIXNet:
+    return STARIXNet(
+        2,
+        enforced_periods=[2],
+        max_periods=1,
+        min_peak_distance=2,
+        lagged_steps=4,
+        forecast_steps=2,
+        applied_attributes=[attribute],
+    )
+
+
+def test_time_index_is_the_integer_utc_minute() -> None:
+    endog = _parity_series("2026-11-03 00:01", 10)
+    model = _parity_model()
+    model.fit(endog, epochs=1, seed=0)
+    expected = endog.index.as_unit("s").asi8 // 60
+    for unit in ("s", "us", "ns"):
+        scaled = model._scale_frame(endog.set_axis(endog.index.as_unit(unit)), model._endog_scalers)
+        np.testing.assert_array_equal(scaled.index.to_numpy(), expected)
+
+
+@pytest.mark.parametrize("attribute", ["temporal", "seasonal"])
+def test_time_decoders_separate_odd_and_even_minutes(attribute: str) -> None:
+    endog = _parity_series("2026-11-03", 600)
+    model = _parity_model(attribute).fit(endog, batch_size=64, epochs=300, seed=0)
+    preds = model.predict(endog.iloc[-6:])
+    minutes = endog.index[-1:].as_unit("s").asi8 // 60 + np.arange(1, 3)
+    np.testing.assert_allclose(preds[-1, :, 0], np.where(minutes % 2 == 0, 10.0, 20.0), atol=1.0)
+
+
+def test_seed_makes_training_reproducible() -> None:
+    endog = _parity_series("2026-11-03", 120)
+
+    def fit_predict(seed: int) -> np.ndarray:
+        return _parity_model().fit(endog, epochs=2, seed=seed).predict(endog.iloc[-6:])
+
+    np.testing.assert_array_equal(fit_predict(1), fit_predict(1))
+    assert not np.array_equal(fit_predict(1), fit_predict(2))
