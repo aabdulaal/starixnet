@@ -37,6 +37,13 @@ ExogFrames = pd.DataFrame | list[pd.DataFrame]
 Scalers = tuple[pd.Series, pd.Series]
 
 
+def _epoch_index(index: pd.Index) -> np.ndarray:
+    """Return the index as int64 epoch values: nanoseconds for datetimes (any resolution, UTC), else as given."""
+    if isinstance(index, pd.DatetimeIndex):
+        return index.as_unit("ns").asi8
+    return index.to_numpy(dtype=np.int64)
+
+
 def _is_multi_exog(exog: ExogFrames | None) -> bool:
     """True iff ``exog`` is a list of frames (i.e. several exogenous groups)."""
     return isinstance(exog, list)
@@ -201,7 +208,7 @@ class BaseModel(nn.Module):
             else:
                 self._exog_scalers = (exog.min(), exog.max())
 
-        epochtime = endog.index.astype(int)[:2]
+        epochtime = _epoch_index(endog.index)[:2]
         self._time_scaler = int(epochtime[1] - epochtime[0])
         return self
 
@@ -221,7 +228,7 @@ class BaseModel(nn.Module):
 
     def _scale_frame(self, df: pd.DataFrame, scalers: Scalers) -> pd.DataFrame:
         scaled = minmax_scale(df, scalers, scaling_range=self.minmaxscaler_range)
-        scaled.index = scaled.index.astype(int) // self._time_scaler
+        scaled.index = pd.Index(_epoch_index(scaled.index) // self._time_scaler)
         return scaled
 
     def _inverse_transform(self, scaled: np.ndarray) -> np.ndarray:
@@ -361,6 +368,7 @@ class STARIXNet(BaseModel):
         early_stopping_patience: int = -1,
         validation_split: float = 0.0,
         sample_weights: pd.DataFrame | None = None,
+        seed: int | None = None,
         **kwargs: Any,
     ) -> Self:
         """Train (or continue training) the network by minimizing quantile loss.
@@ -376,11 +384,14 @@ class STARIXNet(BaseModel):
             early_stopping_patience: Validation patience in epochs (``<= 0`` to disable).
             validation_split: Fraction of the tail used for validation.
             sample_weights: Optional per-sample weight series aligned to ``endog``.
+            seed: Seeds torch's global RNG before training, which fixes weight initialization and batch order.
             **kwargs: Forwarded to :meth:`BaseModel.fit`.
 
         Returns:
             ``self`` after training.
         """
+        if seed is not None:
+            torch.manual_seed(seed)
         endog, exog = super().fit(endog, exog=exog, **kwargs)
         endog, exog = self._preprocess_fit(endog, exog)._preprocess_transform(endog, exog)
 
@@ -774,8 +785,8 @@ class STARIXNet(BaseModel):
         freqs = self._params["freqs"].view(1, 1, -1, 1)  # (1, 1, F, 1)
         phases = self._params["phases"].unsqueeze(0).unsqueeze(0)  # (1, 1, F, O)
         amps = self._params["amps"].unsqueeze(0).unsqueeze(0)  # (1, 1, F, O)
-        x = x_t.view(b, t, 1, 1)
-        wave = torch.sin(freqs * x + phases)
+        x = x_t.view(b, t, 1, 1).double()
+        wave = torch.sin(freqs.double() * x + phases.double()).float()
         return (amps * wave).sum(dim=2) + self._params["disps"]
 
     def _forward_temporal(self, x_t: torch.Tensor) -> torch.Tensor:
@@ -1009,7 +1020,7 @@ class STARIXNet(BaseModel):
         slice_: slice,
     ) -> list[torch.Tensor]:
         tensors: list[torch.Tensor] = [
-            self._frame_to_tensor(x_time.iloc[slice_], self.forecast_steps, 1),
+            self._frame_to_tensor(x_time.iloc[slice_], self.forecast_steps, 1, dtype=np.int64),
             self._frame_to_tensor(x_endog.iloc[slice_], self.lagged_steps, self._endog_size),
         ]
         if x_exog is not None:
@@ -1025,8 +1036,10 @@ class STARIXNet(BaseModel):
         return tensors
 
     @staticmethod
-    def _frame_to_tensor(df: pd.DataFrame, steps: int, features: int) -> torch.Tensor:
-        return torch.from_numpy(df.to_numpy(dtype=np.float32)).reshape(-1, steps, features)
+    def _frame_to_tensor(
+        df: pd.DataFrame, steps: int, features: int, dtype: type[np.generic] = np.float32
+    ) -> torch.Tensor:
+        return torch.from_numpy(df.to_numpy(dtype=dtype)).reshape(-1, steps, features)
 
     def _select_endog_columns(self, endog: pd.DataFrame) -> pd.DataFrame:
         missing = [f for f in self._endog_labels if f not in endog.columns]
